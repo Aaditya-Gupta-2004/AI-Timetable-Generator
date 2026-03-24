@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import Layout from "./Layout";
 
-const API_BASE = "http://localhost:8000"; // Ensure this matches your backend URL
+const API_BASE = "https://ai-timetable-generator-j7qx.onrender.com"; // Ensure this matches your backend URL
 
 const DAYS     = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
 const SLOTS    = ["9-10", "10-11", "11-12", "12-1", "1-2", "2-3", "3-4", "4-5"];

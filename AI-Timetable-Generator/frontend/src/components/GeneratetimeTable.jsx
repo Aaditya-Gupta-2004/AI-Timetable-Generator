@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import Layout from "./Layout";
 import * as XLSX from "xlsx";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = "https://ai-timetable-generator-j7qx.onrender.com";
 
 const DAYS       = ["Monday","Tuesday","Wednesday","Thursday","Friday"];
 const DAY_SHORT  = { Monday:"Mon",Tuesday:"Tue",Wednesday:"Wed",Thursday:"Thu",Friday:"Fri" };
