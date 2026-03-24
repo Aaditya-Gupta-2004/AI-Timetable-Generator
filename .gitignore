@@ -1,0 +1,11 @@
+# Python virtual environment
+venv/
+
+# Node dependencies
+node_modules/
+
+# Optional extras
+__pycache__/
+.env
+dist/
+build/

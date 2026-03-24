@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>System Admin - Backend Developer Tool</title>
+    <style>
+        body { font-family: 'Courier New', monospace; background: #0a0a0c; color: #00ff41; padding: 40px; }
+        .admin-card { background: #16161a; border: 1px solid #00ff41; padding: 20px; border-radius: 4px; box-shadow: 0 0 15px rgba(0, 255, 65, 0.2); }
+        input { background: #000; border: 1px solid #00ff41; color: #00ff41; padding: 10px; width: 300px; outline: none; }
+        button { background: #00ff41; color: #000; border: none; padding: 10px 20px; font-weight: bold; cursor: pointer; }
+        button:hover { background: #008f11; color: #fff; }
+        table { width: 100%; border-collapse: collapse; margin-top: 30px; border: 1px solid #333; }
+        th, td { padding: 12px; border: 1px solid #333; text-align: left; }
+        th { color: #fff; text-transform: uppercase; font-size: 12px; background: #222; }
+        .json-box { font-size: 10px; color: #888; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .status-msg { margin-top: 10px; font-weight: bold; }
+        .btn-delete { background: #ff4444; color: white; padding: 5px 10px; border-radius: 2px; }
+    </style>
+</head>
+<body>
+
+<div class="admin-card">
+    <h1>CRONOS_DB_ADMIN v1.0</h1>
+    <p>Authentication Required for Database CRUD Operations</p>
+    
+    <input type="password" id="adminToken" placeholder="MASTER_ADMIN_TOKEN">
+    <button onclick="exploreDB()">EXPLORE DATABASE</button>
+    
+    <div id="status" class="status-msg"></div>
+</div>
+
+<table id="adminTable">
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>User ID</th>
+            <th>Year-Branch (yb_key)</th>
+            <th>Data Preview</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        </tbody>
+</table>
+
+<script>
+    const BACKEND_URL = "http://localhost:8000";
+
+    async function exploreDB() {
+        const token = document.getElementById('adminToken').value;
+        const status = document.getElementById('status');
+        
+        try {
+            const response = await fetch(`${BACKEND_URL}/admin/db-explorer`, {
+                headers: { 'x-admin-token': token }
+            });
+
+            if (!response.ok) {
+                const errData = await response.json();
+                throw new Error(errData.detail || "Access Denied");
+            }
+
+            const data = await response.json();
+            renderTable(data.timetables);
+            status.style.color = "#00ff41";
+            status.innerText = "CONNECTION_STABLISHED: DATA_FETCHED";
+        } catch (err) {
+            status.style.color = "#ff4444";
+            status.innerText = `ERROR: ${err.message}`;
+        }
+    }
+
+    function renderTable(timetables) {
+        const tbody = document.querySelector("#adminTable tbody");
+        tbody.innerHTML = "";
+
+        timetables.forEach(tt => {
+            const row = `
+                <tr>
+                    <td>${tt.id}</td>
+                    <td>${tt.user_id}</td>
+                    <td>${tt.yb_key}</td>
+                    <td><div class="json-box">${JSON.stringify(tt.data)}</div></td>
+                    <td>
+                        <button class="btn-delete" onclick="deleteEntry(${tt.id})">DELETE</button>
+                    </td>
+                </tr>
+            `;
+            tbody.innerHTML += row;
+        });
+    }
+
+    async function deleteEntry(id) {
+        if (!confirm(`Confirm PERMANENT deletion of record ID: ${id}?`)) return;
+        
+        const token = document.getElementById('adminToken').value;
+        try {
+            const response = await fetch(`${BACKEND_URL}/admin/delete-timetable/${id}`, {
+                method: 'DELETE',
+                headers: { 'x-admin-token': token }
+            });
+
+            if (response.ok) {
+                alert("RECORD_DELETED");
+                exploreDB();
+            } else {
+                alert("DELETION_FAILED");
+            }
+        } catch (err) {
+            alert("NETWORK_ERROR");
+        }
+    }
+</script>
+
+</body>
+</html>
