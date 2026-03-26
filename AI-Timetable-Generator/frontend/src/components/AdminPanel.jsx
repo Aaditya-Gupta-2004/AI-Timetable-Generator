@@ -7,7 +7,7 @@ export default function AdminPanel() {
 
   const fetchAdminData = async () => {
     const token = localStorage.getItem("token");
-    const res = await fetch("http://localhost:8000/admin/all-timetables", {
+    const res = await fetch("https://ai-timetable-generator-j7qx.onrender.com/admin/all-timetables", {
       headers: { Authorization: `Bearer ${token}` }
     });
     const data = await res.json();

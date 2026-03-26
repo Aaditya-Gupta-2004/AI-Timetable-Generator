@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import Layout from "./Layout";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = "https://ai-timetable-generator-j7qx.onrender.com";
 
 const AVATAR_COLORS = [
   ["#FF3B7A","#ff7eb3"],["#667eea","#764ba2"],["#00C9A7","#00a387"],

@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate, NavLink } from "react-router-dom";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = "https://ai-timetable-generator-j7qx.onrender.com";
 
 const NAV_ITEMS = [
   { label: "Dashboard",          path: "/dashboard", icon: "🏠" },

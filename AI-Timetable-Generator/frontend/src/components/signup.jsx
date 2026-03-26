@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import * as THREE from "three";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = "https://ai-timetable-generator-j7qx.onrender.com";
 
 function ThreeBackground() {
   const mountRef = useRef(null);
