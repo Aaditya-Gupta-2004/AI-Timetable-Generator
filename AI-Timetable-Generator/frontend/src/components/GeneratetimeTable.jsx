@@ -5,7 +5,6 @@ import Layout from "./Layout";
 import * as XLSX from "xlsx";
 
 const API_BASE = "https://ai-timetable-generator-j7qx.onrender.com";
-// ... rest of your code
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
 const DAY_SHORT = { Monday: "Mon", Tuesday: "Tue", Wednesday: "Wed", Thursday: "Thu", Friday: "Fri" };
@@ -84,39 +83,40 @@ function buildEmptyGrid() {
   return g;
 }
 
-function tryPlaceLabBlock(grid, day, cellData, labSz) {
+function tryPlaceLabBlock(grid, day, cellData, labSz, globalLabSlots) {
   for (const si of validLabStarts(labSz)) {
     const cands = ALLOC.slice(si, si + labSz);
-    if (cands.every(s => grid[day][s].subject === "")) {
-      cands.forEach(s => { grid[day][s] = { ...cellData }; });
-      return true;
+    if (!cands.every(s => grid[day][s].subject === "")) continue;
+    const slotKey = `${si}_${labSz}`;
+    if (globalLabSlots && globalLabSlots[day]?.[slotKey]) continue;
+    cands.forEach(s => { grid[day][s] = { ...cellData }; });
+    if (globalLabSlots) {
+      if (!globalLabSlots[day]) globalLabSlots[day] = {};
+      globalLabSlots[day][slotKey] = true;
     }
+    return true;
   }
   return false;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// FIX 1: CORE LAB ROTATION ENGINE — properly handles weeklyLabs sessions
-//
-// For N lab subjects and M batches, each "session" places ALL batches simultaneously
-// on the same time slot, with rotation so each batch does a different subject.
-// weeklyLabs = how many times per week this entire rotation repeats.
-// ─────────────────────────────────────────────────────────────────────────────
-function placeLabRotations(grid, labSubjects, div, numBatches, assignments, labPool) {
+function labSessionsOnDay(grid, day, labSz) {
+  let count = 0;
+  for (const si of validLabStarts(labSz)) {
+    const cands = ALLOC.slice(si, si + labSz);
+    if (cands.every(s => grid[day][s]?.isLabRotation)) count++;
+  }
+  return count;
+}
+
+function placeLabRotations(grid, labSubjects, div, numBatches, assignments, labPool, globalLabSlots) {
   if (!labSubjects.length) return;
   const batches = getBatches(div, numBatches);
   const labSz = parseInt(labSubjects[0]?.labHours) || 2;
-
-  // weeklyLabs is per-subject — use the value from first lab subject
-  // This is how many rotation sessions happen per week
   const weeklyLabSessions = parseInt(labSubjects[0]?.weeklyLabs) || 1;
-
   const lUsed = {};
-  // Shuffle days so sessions are spread across the week
   const shuffledDays = [...DAYS].sort(() => Math.random() - 0.5);
 
   for (let sessionIdx = 0; sessionIdx < weeklyLabSessions; sessionIdx++) {
-    // Build batch assignments for this session (rotation shifts by sessionIdx)
     const batchAssigns = batches.map((batch, bi) => {
       const subIdx = (bi + sessionIdx) % labSubjects.length;
       const sub = labSubjects[subIdx];
@@ -139,32 +139,32 @@ function placeLabRotations(grid, labSubjects, div, numBatches, assignments, labP
       isLabRotation: true,
     };
 
-    // Try to place on each day (prefer different days per session)
     let placed = false;
-    for (const day of shuffledDays) {
-      if (tryPlaceLabBlock(grid, day, cellData, labSz)) { placed = true; break; }
+    const daysByLabLoad = [...shuffledDays].sort((a, b) => {
+      const la = labSessionsOnDay(grid, a, labSz);
+      const lb = labSessionsOnDay(grid, b, labSz);
+      return la - lb;
+    });
+
+    for (const day of daysByLabLoad) {
+      const sessionsThisDay = labSessionsOnDay(grid, day, labSz);
+      if (sessionsThisDay >= 2) continue;
+      if (tryPlaceLabBlock(grid, day, cellData, labSz, globalLabSlots)) { placed = true; break; }
     }
-    // Fallback: try all days in order
     if (!placed) {
       for (const day of DAYS) {
-        if (tryPlaceLabBlock(grid, day, cellData, labSz)) { placed = true; break; }
+        if (tryPlaceLabBlock(grid, day, cellData, labSz, globalLabSlots)) { placed = true; break; }
       }
     }
-    // Last resort: try to fit in any available consecutive slot
     if (!placed) {
       for (const day of DAYS) {
-        // Try smaller lab size if needed
-        for (let sz = labSz; sz >= 1; sz--) {
-          if (tryPlaceLabBlock(grid, day, cellData, sz)) { placed = true; break; }
-        }
-        if (placed) break;
+        if (tryPlaceLabBlock(grid, day, cellData, labSz, null)) { placed = true; break; }
       }
     }
   }
 }
 
-// ── Main timetable generator ──────────────────────────────────────────────────
-function generateTimetable(subjects, assignments, roomPools, numBatches, div) {
+function generateTimetable(subjects, assignments, roomPools, numBatches, div, globalLabSlots) {
   const grid = buildEmptyGrid();
   const labSubjects = subjects.filter(s => isCoreLab(s.type));
   const theorySubjects = subjects.filter(s => s.type === "theory");
@@ -174,10 +174,8 @@ function generateTimetable(subjects, assignments, roomPools, numBatches, div) {
   const labPool = roomPools.lab || [];
   const cUsed = {}, eUsed = {};
 
-  // 1. Place lab rotations first (they need consecutive slots)
-  placeLabRotations(grid, labSubjects, div, numBatches, assignments, labPool);
+  placeLabRotations(grid, labSubjects, div, numBatches, assignments, labPool, globalLabSlots);
 
-  // 2. Place electives (grouped)
   const placedGroups = new Set();
   const electiveGroups = {};
   electiveSubjects.forEach(sub => {
@@ -220,7 +218,6 @@ function generateTimetable(subjects, assignments, roomPools, numBatches, div) {
     }
   });
 
-  // 3. Place theory subjects
   theorySubjects.forEach(({ id, name, hours }) => {
     const a = assignments?.[id] || {};
     const tCode = a.teacherCode || "";
@@ -278,7 +275,68 @@ function buildTeacherTTs(allTimetables, teachers) {
   return res;
 }
 
-// ── FIX 3: Searchable Teacher Dropdown — renders portal to document.body to avoid overflow:hidden clipping ──
+// ── Build Lab Room Timetables ─────────────────────────────────────────────────
+// Returns: { [roomNumber]: { [day]: { [slot]: { batch, subjectName, teacherCode, ybLabel, div } | null } } }
+function buildLabRoomTTs(allTimetables) {
+  const roomTTs = {};
+  Object.entries(allTimetables).forEach(([ybKey, divGrids]) => {
+    Object.entries(divGrids).forEach(([div, grid]) => {
+      DAYS.forEach(day => {
+        SLOTS.forEach(slot => {
+          const cell = grid[day]?.[slot];
+          if (!cell || cell.subject === "BREAK" || !cell.isLabRotation) return;
+          if (!cell.batches?.length) return;
+          cell.batches.forEach(b => {
+            if (!b.room) return;
+            if (!roomTTs[b.room]) {
+              roomTTs[b.room] = {};
+              DAYS.forEach(d => {
+                roomTTs[b.room][d] = {};
+                SLOTS.forEach(s => { roomTTs[b.room][d][s] = null; });
+              });
+            }
+            roomTTs[b.room][day][slot] = {
+              batch: b.batch,
+              subjectName: b.subjectName,
+              teacherCode: b.teacherCode,
+              ybLabel: ybKey,
+              div,
+            };
+          });
+        });
+      });
+    });
+  });
+  return roomTTs;
+}
+
+function buildLabView(allTimetables) {
+  const labView = {};
+  Object.entries(allTimetables).forEach(([ybKey, divGrids]) => {
+    labView[ybKey] = {};
+    Object.entries(divGrids).forEach(([div, grid]) => {
+      labView[ybKey][div] = {};
+      DAYS.forEach(day => {
+        const labSlots = [];
+        const seenSlots = new Set();
+        SLOTS.forEach(slot => {
+          const cell = grid[day][slot];
+          if (!cell || cell.subject === "BREAK") return;
+          if (cell.isLabRotation || cell.batches?.length > 0) {
+            if (!seenSlots.has(slot)) {
+              cell.batches?.forEach(() => seenSlots.add(slot));
+              labSlots.push({ slot, cell });
+            }
+          }
+        });
+        if (labSlots.length > 0) labView[ybKey][div][day] = labSlots;
+      });
+    });
+  });
+  return labView;
+}
+
+// ── Searchable Teacher Dropdown ───────────────────────────────────────────────
 function TeacherSelect({ value, onChange, teachers, placeholder = "— select teacher —" }) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -288,15 +346,10 @@ function TeacherSelect({ value, onChange, teachers, placeholder = "— select te
   const filtered = teachers.filter(t => `${t.code} ${t.name}`.toLowerCase().includes(search.toLowerCase()));
   const selected = teachers.find(t => t.code === value);
 
-  // Position dropdown relative to trigger button
   const openDropdown = () => {
     if (triggerRef.current) {
       const rect = triggerRef.current.getBoundingClientRect();
-      setDropPos({
-        top: rect.bottom + window.scrollY + 2,
-        left: rect.left + window.scrollX,
-        width: rect.width,
-      });
+      setDropPos({ top: rect.bottom + window.scrollY + 2, left: rect.left + window.scrollX, width: rect.width });
     }
     setOpen(o => !o);
     setSearch("");
@@ -305,66 +358,21 @@ function TeacherSelect({ value, onChange, teachers, placeholder = "— select te
   useEffect(() => {
     if (!open) return;
     const h = e => {
-      if (
-        triggerRef.current && !triggerRef.current.contains(e.target) &&
-        dropRef.current && !dropRef.current.contains(e.target)
-      ) setOpen(false);
+      if (triggerRef.current && !triggerRef.current.contains(e.target) && dropRef.current && !dropRef.current.contains(e.target)) setOpen(false);
     };
     document.addEventListener("mousedown", h);
     return () => document.removeEventListener("mousedown", h);
   }, [open]);
 
-  // Render dropdown as portal to avoid table overflow clipping
   const dropdown = open ? (
-    <div
-      ref={dropRef}
-      style={{
-        position: "absolute",
-        zIndex: 99999,
-        top: dropPos.top,
-        left: dropPos.left,
-        width: dropPos.width,
-        background: "#fff",
-        border: "1.5px solid #667eea",
-        borderRadius: 8,
-        boxShadow: "0 8px 32px rgba(102,126,234,.25)",
-        overflow: "hidden",
-      }}
-    >
+    <div ref={dropRef} style={{ position: "absolute", zIndex: 99999, top: dropPos.top, left: dropPos.left, width: dropPos.width, background: "#fff", border: "1.5px solid #667eea", borderRadius: 8, boxShadow: "0 8px 32px rgba(102,126,234,.25)", overflow: "hidden" }}>
       <div style={{ padding: "8px 10px", borderBottom: "1px solid #eee" }}>
-        <input
-          autoFocus
-          type="text"
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          placeholder="Search teacher..."
-          style={{ ...S.input, padding: "6px 10px", fontSize: 12, border: "1px solid #d0d5dd" }}
-          onClick={e => e.stopPropagation()}
-        />
+        <input autoFocus type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search teacher..." style={{ ...S.input, padding: "6px 10px", fontSize: 12, border: "1px solid #d0d5dd" }} onClick={e => e.stopPropagation()} />
       </div>
       <div style={{ maxHeight: 200, overflowY: "auto" }}>
-        <div
-          onClick={() => { onChange(""); setOpen(false); }}
-          style={{ padding: "8px 14px", cursor: "pointer", fontSize: 12, color: "#aaa", borderBottom: "1px solid #f5f5f5" }}
-        >
-          — none —
-        </div>
+        <div onClick={() => { onChange(""); setOpen(false); }} style={{ padding: "8px 14px", cursor: "pointer", fontSize: 12, color: "#aaa", borderBottom: "1px solid #f5f5f5" }}>— none —</div>
         {filtered.map(t => (
-          <div
-            key={t.id}
-            onClick={() => { onChange(t.code); setOpen(false); }}
-            style={{
-              padding: "8px 14px",
-              cursor: "pointer",
-              fontSize: 12,
-              background: value === t.code ? "#f0f2ff" : "transparent",
-              borderTop: "1px solid #f5f5f5",
-              display: "flex",
-              gap: 8,
-            }}
-            onMouseEnter={e => e.currentTarget.style.background = "#f5f7ff"}
-            onMouseLeave={e => e.currentTarget.style.background = value === t.code ? "#f0f2ff" : "transparent"}
-          >
+          <div key={t.id} onClick={() => { onChange(t.code); setOpen(false); }} style={{ padding: "8px 14px", cursor: "pointer", fontSize: 12, background: value === t.code ? "#f0f2ff" : "transparent", borderTop: "1px solid #f5f5f5", display: "flex", gap: 8 }} onMouseEnter={e => e.currentTarget.style.background = "#f5f7ff"} onMouseLeave={e => e.currentTarget.style.background = value === t.code ? "#f0f2ff" : "transparent"}>
             <span style={{ fontFamily: "monospace", fontWeight: 700, color: "#667eea", minWidth: 60 }}>{t.code}</span>
             <span>{t.name}</span>
           </div>
@@ -376,36 +384,16 @@ function TeacherSelect({ value, onChange, teachers, placeholder = "— select te
 
   return (
     <>
-      <div
-        ref={triggerRef}
-        onClick={openDropdown}
-        style={{
-          ...S.input,
-          cursor: "pointer",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          padding: "8px 12px",
-          minHeight: 38,
-          userSelect: "none",
-        }}
-      >
-        {selected
-          ? <span><strong style={{ color: "#667eea", fontFamily: "monospace" }}>{selected.code}</strong> – {selected.name}</span>
-          : <span style={{ color: "#999" }}>{placeholder}</span>}
+      <div ref={triggerRef} onClick={openDropdown} style={{ ...S.input, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 12px", minHeight: 38, userSelect: "none" }}>
+        {selected ? <span><strong style={{ color: "#667eea", fontFamily: "monospace" }}>{selected.code}</strong> – {selected.name}</span> : <span style={{ color: "#999" }}>{placeholder}</span>}
         <span style={{ fontSize: 10, color: "#aaa", marginLeft: 8 }}>{open ? "▲" : "▼"}</span>
       </div>
-      {/* Portal: render to body so table overflow doesn't clip */}
-      {typeof document !== "undefined" &&
-        ReactDOM.createPortal(dropdown, document.body)}
+      {typeof document !== "undefined" && ReactDOM.createPortal(dropdown, document.body)}
     </>
   );
 }
 
-// Since we need ReactDOM for portal, import it at top
-// Add this import at the very top of the file: import ReactDOM from "react-dom";
-
-// ── PDF Generator ─────────────────────────────────────────────────────────────
+// ── FIX 2: PDF Generator — full elective details + FIX lab faculty name ───────
 function generatePDF(grid, caption, dept, semLabel, teachers, footerRoles) {
   const printWindow = window.open("", "_blank");
   if (!printWindow) { alert("Please allow popups."); return; }
@@ -424,17 +412,39 @@ function generatePDF(grid, caption, dept, semLabel, teachers, footerRoles) {
       cell.batches.forEach(b => {
         if (shownSubs.has(b.subjectName)) return;
         shownSubs.add(b.subjectName);
+        // FIX: look up teacher by b.teacherCode (not cell.teacherCode)
         const tO = teachers.find(t => t.code === b.teacherCode);
-        subjectRows += `<tr><td>${srNo++}</td><td>${b.subjectName}</td><td>${b.batch}</td><td>${b.teacherCode || "—"}</td><td>${tO?.name || "—"}</td><td>${b.room || "—"}</td></tr>`;
+        subjectRows += `<tr>
+          <td>${srNo++}</td>
+          <td>${b.subjectName}</td>
+          <td>${b.batch}</td>
+          <td>${b.teacherCode || "—"}</td>
+          <td>${tO?.name || "—"}</td>
+          <td>${b.room || "—"}</td>
+        </tr>`;
       });
     } else if (cell.electives?.length) {
       cell.electives.forEach(e => {
         const tO = teachers.find(t => t.code === e.teacherCode);
-        subjectRows += `<tr><td>${srNo++}</td><td>${e.name}</td><td>${cell.subject}</td><td>${e.teacherCode || "—"}</td><td>${tO?.name || "—"}</td><td>${e.room || "—"}</td></tr>`;
+        subjectRows += `<tr>
+          <td>${srNo++}</td>
+          <td>${e.name}</td>
+          <td style="font-style:italic;color:#7c5c00;">${cell.subject}</td>
+          <td>${e.teacherCode || "—"}</td>
+          <td>${tO?.name || "—"}</td>
+          <td>${e.room || "—"}</td>
+        </tr>`;
       });
     } else {
       const tO = teachers.find(t => t.code === cell.teacherCode);
-      subjectRows += `<tr><td>${srNo++}</td><td>${cell.subject}</td><td>—</td><td>${cell.teacherCode || "—"}</td><td>${tO?.name || "—"}</td><td>${cell.room || "—"}</td></tr>`;
+      subjectRows += `<tr>
+        <td>${srNo++}</td>
+        <td>${cell.subject}</td>
+        <td>—</td>
+        <td>${cell.teacherCode || "—"}</td>
+        <td>${tO?.name || "—"}</td>
+        <td>${cell.room || "—"}</td>
+      </tr>`;
     }
   }));
 
@@ -445,13 +455,27 @@ function generatePDF(grid, caption, dept, semLabel, teachers, footerRoles) {
       if (slot === BREAK_SLOT) return `<td class="break-cell">BREAK</td>`;
       if (!cell?.subject) return `<td>—</td>`;
       if (cell.batches?.length) {
-        const batchLines = cell.batches.map(b =>
-          `<div class="batch-line"><span class="batch-tag">${b.batch}</span> <strong>${b.subjectName}</strong>${b.room ? ` <span class="room-tag">${b.room}</span>` : ""}</div>`
-        ).join("");
+        const batchLines = cell.batches.map(b => {
+          // FIX: resolve teacher name per batch
+          const tO = teachers.find(t => t.code === b.teacherCode);
+          return `<div class="batch-line">
+            <span class="batch-tag">${b.batch}</span>
+            <strong>${b.subjectName}</strong>
+            ${tO ? `<span class="tc">${tO.name}</span>` : (b.teacherCode ? `<span class="tc">${b.teacherCode}</span>` : "")}
+            ${b.room ? `<span class="room-tag">${b.room}</span>` : ""}
+          </div>`;
+        }).join("");
         return `<td class="lab-cell">${batchLines}</td>`;
       }
       if (cell.electives?.length) {
-        return `<td class="elective-cell"><strong>${cell.subject}</strong><br/><small>(${cell.electives.length} opts)</small></td>`;
+        const electiveLines = cell.electives.map(e =>
+          `<div class="elective-opt-line">
+            <strong>${e.name}</strong>
+            ${e.teacherCode ? `<span class="tc">${e.teacherCode}</span>` : ""}
+            ${e.room ? `<span class="room-tag">${e.room}</span>` : ""}
+          </div>`
+        ).join("");
+        return `<td class="elective-cell"><div class="elective-group-label">${cell.subject}</div>${electiveLines}</td>`;
       }
       return `<td><strong>${cell.subject}</strong>${cell.teacherCode ? `<br/><small class="tc">${cell.teacherCode}</small>` : ""}${cell.room ? `<br/><span class="room-tag">${cell.room}</span>` : ""}</td>`;
     }).join("");
@@ -473,12 +497,14 @@ function generatePDF(grid, caption, dept, semLabel, teachers, footerRoles) {
       th { background: #667eea; color: #fff; font-weight: 700; }
       .day-cell { background: #f1f5ff; font-weight: 700; }
       .break-cell { background: #fff3e0; color: #e65100; font-weight: 700; font-style: italic; }
-      .lab-cell { background: #e8f5e9; color: #2e7d32; }
-      .elective-cell { background: #fffbf0; color: #92400e; }
-      .batch-line { margin-bottom: 2px; font-size: 9px; }
+      .lab-cell { background: #e8f5e9; color: #2e7d32; text-align: left; }
+      .elective-cell { background: #fffbf0; color: #92400e; text-align: left; }
+      .elective-group-label { font-weight: 700; font-size: 9px; color: #b45309; border-bottom: 1px solid #fcd34d; padding-bottom: 2px; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.5px; }
+      .elective-opt-line { margin-bottom: 3px; padding: 2px 4px; background: rgba(252,211,77,0.15); border-radius: 3px; font-size: 9px; }
+      .batch-line { margin-bottom: 4px; font-size: 9px; display: flex; align-items: flex-start; flex-wrap: wrap; gap: 3px; }
       .batch-tag { background: #e9d8fd; color: #553c9a; padding: 1px 4px; border-radius: 3px; font-size: 8px; font-weight: 700; }
       .room-tag { background: #ebf4ff; color: #2c5282; padding: 1px 4px; border-radius: 3px; font-size: 8px; font-weight: 700; }
-      .tc { color: #888; font-family: monospace; }
+      .tc { color: #666; font-family: monospace; font-size: 8px; }
       .footer-signs { display: flex; justify-content: space-between; margin-top: 18px; padding-top: 8px; }
       .sign-block { text-align: center; min-width: 160px; }
       .sign-label { font-size: 10px; font-weight: 700; color: #334; border-top: 1.5px solid #666; padding-top: 4px; margin-top: 32px; }
@@ -488,10 +514,62 @@ function generatePDF(grid, caption, dept, semLabel, teachers, footerRoles) {
       <div class="header"><h2>${dept}</h2><h3>${semLabel}</h3><p>${caption}</p></div>
       <table><thead><tr><th>Day</th>${SLOTS.map(s => `<th>${SLOT_LBL[s]}</th>`).join("")}</tr></thead><tbody>${gridHTML}</tbody></table>
       <table class="subject-table">
-        <thead><tr><th>#</th><th>Subject</th><th>Batch/Elective</th><th>Faculty Code</th><th>Faculty Name</th><th>Room/Lab</th></tr></thead>
+        <thead><tr><th>#</th><th>Subject</th><th>Batch/Elective Group</th><th>Faculty Code</th><th>Faculty Name</th><th>Room/Lab</th></tr></thead>
         <tbody>${subjectRows}</tbody>
       </table>
       <div class="footer-signs">${signBlocks}</div>
+    </body></html>
+  `);
+  printWindow.document.close();
+  setTimeout(() => printWindow.print(), 500);
+}
+
+// ── Lab Room PDF ──────────────────────────────────────────────────────────────
+function generateLabRoomPDF(roomNumber, roomGrid, dept, semLabel, teachers) {
+  const printWindow = window.open("", "_blank");
+  if (!printWindow) { alert("Please allow popups."); return; }
+
+  let gridHTML = "";
+  DAYS.forEach(day => {
+    const cells = SLOTS.map(slot => {
+      if (slot === BREAK_SLOT) return `<td class="break-cell">BREAK</td>`;
+      const entry = roomGrid[day]?.[slot];
+      if (!entry) return `<td style="color:#ccc;">—</td>`;
+      const tO = teachers.find(t => t.code === entry.teacherCode);
+      return `<td class="lab-cell">
+        <span class="batch-tag">${entry.batch}</span>
+        <strong style="display:block;margin-top:3px;">${entry.subjectName}</strong>
+        ${tO ? `<span class="tc">${tO.name}</span>` : (entry.teacherCode ? `<span class="tc">${entry.teacherCode}</span>` : "")}
+        <br/><span style="font-size:8px;color:#888;">${entry.ybLabel} / Div ${entry.div}</span>
+      </td>`;
+    }).join("");
+    gridHTML += `<tr><td class="day-cell">${DAY_SHORT[day]}</td>${cells}</tr>`;
+  });
+
+  printWindow.document.write(`
+    <!DOCTYPE html><html><head><title>Lab Room ${roomNumber}</title><style>
+      @page { size: A3 landscape; margin: 15mm; }
+      body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; color: #222; }
+      .header { text-align: center; margin-bottom: 12px; }
+      .header h2 { margin: 0; font-size: 16px; } .header h3 { margin: 4px 0; font-size: 13px; color: #276749; }
+      table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
+      th, td { border: 1px solid #d0d5dd; padding: 7px 8px; text-align: center; font-size: 10px; vertical-align: top; }
+      th { background: #276749; color: #fff; font-weight: 700; }
+      .day-cell { background: #f0fff4; font-weight: 700; color: #276749; }
+      .break-cell { background: #fff3e0; color: #e65100; font-weight: 700; font-style: italic; }
+      .lab-cell { background: #f0fff4; color: #276749; text-align: left; padding: 6px 8px; }
+      .batch-tag { background: #e9d8fd; color: #553c9a; padding: 1px 5px; border-radius: 3px; font-size: 9px; font-weight: 700; }
+      .tc { color: #555; font-family: monospace; font-size: 9px; }
+    </style></head><body>
+      <div class="header">
+        <h2>${dept}</h2>
+        <h3>Lab Room Timetable — ${roomNumber}</h3>
+        <p>${semLabel}</p>
+      </div>
+      <table>
+        <thead><tr><th>Day</th>${SLOTS.map(s => `<th>${SLOT_LBL[s]}</th>`).join("")}</tr></thead>
+        <tbody>${gridHTML}</tbody>
+      </table>
     </body></html>
   `);
   printWindow.document.close();
@@ -525,17 +603,13 @@ function TimetableTable({ grid, caption }) {
                     {isBreak ? "BREAK" : (
                       <>
                         {!isLab && !isElective && (
-                          <>
-                            <div style={{ fontWeight: 600, fontSize: 12 }}>{val || "—"}</div>
-                            {cell?.teacherCode && <div style={{ fontSize: 10, color: "#666", marginTop: 2, fontFamily: "monospace" }}>{cell.teacherCode}</div>}
-                            {cell?.room && <span style={S.roomBadge}>{cell.room}</span>}
-                          </>
+                          <><div style={{ fontWeight: 600, fontSize: 12 }}>{val || "—"}</div>{cell?.teacherCode && <div style={{ fontSize: 10, color: "#666", marginTop: 2, fontFamily: "monospace" }}>{cell.teacherCode}</div>}{cell?.room && <span style={S.roomBadge}>{cell.room}</span>}</>
                         )}
                         {isElective && (
                           <>
-                            <div style={{ fontWeight: 600, fontSize: 12 }}>{val} ({cell.electives.length} opts)</div>
+                            <div style={{ fontWeight: 700, fontSize: 11, color: "#b45309", borderBottom: "1px solid #fcd34d", paddingBottom: 2, marginBottom: 4 }}>{val}</div>
                             {cell.electives.map((e, ei) => (
-                              <div key={ei} style={{ marginBottom: 3, padding: "2px 5px", background: "#fffbf0", borderRadius: 4, border: "1px solid #fcd34d", fontSize: 10, marginTop: 3 }}>
+                              <div key={ei} style={{ marginBottom: 3, padding: "2px 5px", background: "#fffbf0", borderRadius: 4, border: "1px solid #fcd34d", fontSize: 10 }}>
                                 <div style={{ fontWeight: 700, color: "#92400e" }}>{e.name}</div>
                                 {e.teacherCode && <div style={{ fontSize: 9, color: "#666", fontFamily: "monospace" }}>{e.teacherCode}</div>}
                                 {e.room && <span style={S.roomBadge}>{e.room}</span>}
@@ -578,10 +652,7 @@ function TeacherTTTable({ teacherGrid, caption }) {
       <table style={S.table}>
         <thead>
           <tr><th colSpan={SLOTS.length + 1} style={{ ...S.caption, background: "linear-gradient(90deg,#2d6a4f,#40916c)" }}>{caption}</th></tr>
-          <tr>
-            <th style={S.th}>Day / Time</th>
-            {SLOTS.map(s => <th key={s} style={{ ...S.th, ...(s === BREAK_SLOT ? S.breakTh : {}) }}>{SLOT_LBL[s]}</th>)}
-          </tr>
+          <tr><th style={S.th}>Day / Time</th>{SLOTS.map(s => <th key={s} style={{ ...S.th, ...(s === BREAK_SLOT ? S.breakTh : {}) }}>{SLOT_LBL[s]}</th>)}</tr>
         </thead>
         <tbody>
           {DAYS.map((day, di) => (
@@ -611,17 +682,261 @@ function TeacherTTTable({ teacherGrid, caption }) {
   );
 }
 
+// ── Lab Room Timetable Table ──────────────────────────────────────────────────
+function LabRoomTTTable({ roomNumber, roomGrid, teachers, caption }) {
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table style={S.table}>
+        <thead>
+          <tr>
+            <th colSpan={SLOTS.length + 1} style={{ ...S.caption, background: "linear-gradient(90deg,#276749,#38a169)" }}>
+              {caption}
+            </th>
+          </tr>
+          <tr>
+            <th style={S.th}>Day / Time</th>
+            {SLOTS.map(s => <th key={s} style={{ ...S.th, ...(s === BREAK_SLOT ? S.breakTh : {}) }}>{SLOT_LBL[s]}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {DAYS.map((day, di) => (
+            <tr key={day} style={{ background: di % 2 === 0 ? "#f0fff4" : "#fff" }}>
+              <td style={{ ...S.dayCell, color: "#276749" }}>{DAY_SHORT[day]}</td>
+              {SLOTS.map(slot => {
+                if (slot === BREAK_SLOT) return <td key={slot} style={{ ...S.td, ...S.breakCell }}>BREAK</td>;
+                const entry = roomGrid[day]?.[slot];
+                if (!entry) return <td key={slot} style={{ ...S.td, color: "#ccc" }}>—</td>;
+                const tO = teachers.find(t => t.code === entry.teacherCode);
+                return (
+                  <td key={slot} style={{ ...S.td, background: "#f0fff4", verticalAlign: "top" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 3 }}>
+                      <span style={S.batchTag}>{entry.batch}</span>
+                    </div>
+                    <div style={{ fontWeight: 700, fontSize: 11, color: "#276749" }}>{entry.subjectName}</div>
+                    {tO
+                      ? <div style={{ fontSize: 10, color: "#555", marginTop: 2 }}>{tO.name}</div>
+                      : entry.teacherCode
+                        ? <div style={{ fontSize: 10, color: "#888", fontFamily: "monospace", marginTop: 2 }}>{entry.teacherCode}</div>
+                        : null
+                    }
+                    <div style={{ fontSize: 9, color: "#aaa", marginTop: 3 }}>{entry.ybLabel} / Div {entry.div}</div>
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── Lab Schedule (Division) View ──────────────────────────────────────────────
+function LabViewTable({ allTimetables, yearBranches }) {
+  const [activeYbId, setActiveYbId] = useState(yearBranches[0]?.id || null);
+  const currentYB = yearBranches.find(yb => yb.id === activeYbId);
+  const [activeDiv, setActiveDiv] = useState(currentYB?.divs[0] || null);
+
+  useEffect(() => {
+    if (yearBranches.length > 0 && !activeYbId) setActiveYbId(yearBranches[0].id);
+  }, [yearBranches]);
+  useEffect(() => {
+    if (currentYB && !activeDiv) setActiveDiv(currentYB.divs[0]);
+  }, [currentYB]);
+
+  const grid = allTimetables[activeYbId]?.[activeDiv];
+  if (!grid) return <div style={S.emptyBox}>No timetable generated yet.</div>;
+
+  const labsByDay = {};
+  DAYS.forEach(day => {
+    const slots = [];
+    const seen = new Set();
+    SLOTS.forEach(slot => {
+      const cell = grid[day]?.[slot];
+      if (!cell || cell.subject === "BREAK" || !cell.isLabRotation) return;
+      if (!seen.has(slot)) { seen.add(slot); slots.push({ slot, cell }); }
+    });
+    if (slots.length) labsByDay[day] = slots;
+  });
+
+  const totalLabDays = Object.keys(labsByDay).length;
+  const totalLabSessions = Object.values(labsByDay).reduce((acc, s) => acc + s.length, 0);
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+        {yearBranches.map(yb => (
+          <button key={yb.id} onClick={() => { setActiveYbId(yb.id); setActiveDiv(yb.divs[0]); }}
+            style={{ ...S.tabBtn, ...(activeYbId === yb.id ? S.tabYBActive : {}) }}>{yb.year}-{yb.branch}</button>
+        ))}
+      </div>
+      {currentYB && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 18 }}>
+          {currentYB.divs.map(div => (
+            <button key={div} onClick={() => setActiveDiv(div)}
+              style={{ ...S.tabBtn, ...(activeDiv === div ? S.tabActive : {}) }}>Division {div}</button>
+          ))}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 12, marginBottom: 18, flexWrap: "wrap" }}>
+        <div style={{ padding: "10px 18px", background: "#e8f5e9", borderRadius: 10, border: "1px solid #9ae6b4", fontSize: 13 }}>
+          <span style={{ fontWeight: 700, color: "#276749", fontSize: 18, marginRight: 6 }}>{totalLabSessions}</span>
+          <span style={{ color: "#555" }}>Lab Sessions / Week</span>
+        </div>
+        <div style={{ padding: "10px 18px", background: "#f0f5ff", borderRadius: 10, border: "1px solid #c5d3f5", fontSize: 13 }}>
+          <span style={{ fontWeight: 700, color: "#3451b2", fontSize: 18, marginRight: 6 }}>{totalLabDays}</span>
+          <span style={{ color: "#555" }}>Days with Labs</span>
+        </div>
+        {DAYS.filter(d => labsByDay[d]?.length > 1).length > 0 && (
+          <div style={{ padding: "10px 18px", background: "#fff3cd", borderRadius: 10, border: "1px solid #ffc107", fontSize: 13 }}>
+            <span style={{ fontWeight: 700, color: "#856404", marginRight: 6 }}>⚠</span>
+            <span style={{ color: "#856404" }}>
+              {DAYS.filter(d => labsByDay[d]?.length > 1).map(d => DAY_SHORT[d]).join(", ")} have 2 lab sessions (last resort only)
+            </span>
+          </div>
+        )}
+      </div>
+
+      {totalLabSessions === 0 ? (
+        <div style={S.emptyBox}>No lab sessions found for {activeYbId} / Div {activeDiv}. Make sure Core Lab subjects are added.</div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 14 }}>
+          {DAYS.map(day => {
+            const dayLabs = labsByDay[day] || [];
+            return (
+              <div key={day} style={{ border: dayLabs.length > 0 ? "1.5px solid #9ae6b4" : "1px dashed #e2e8f0", borderRadius: 10, overflow: "hidden" }}>
+                <div style={{ padding: "8px 14px", background: dayLabs.length > 0 ? "#e8f5e9" : "#f8f9fb", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <span style={{ fontWeight: 700, fontSize: 13, color: dayLabs.length > 0 ? "#276749" : "#aaa" }}>{day}</span>
+                  {dayLabs.length > 0
+                    ? <span style={{ fontSize: 11, background: "#276749", color: "#fff", borderRadius: 20, padding: "2px 8px" }}>{dayLabs.length} session{dayLabs.length > 1 ? "s" : ""}</span>
+                    : <span style={{ fontSize: 11, color: "#ccc" }}>No labs</span>}
+                </div>
+                {dayLabs.length === 0 && <div style={{ padding: "14px", fontSize: 12, color: "#ccc", textAlign: "center" }}>Free day</div>}
+                {dayLabs.map(({ slot, cell }, si) => (
+                  <div key={si} style={{ borderTop: si > 0 ? "1px solid #e2e8f0" : "1px solid #9ae6b4", padding: "10px 14px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                      <span style={{ fontFamily: "monospace", fontSize: 11, background: "#f0fff4", border: "1px solid #9ae6b4", borderRadius: 4, padding: "2px 7px", color: "#276749", fontWeight: 700 }}>{SLOT_LBL[slot]?.replace(" (BREAK)", "") || slot}</span>
+                      <span style={{ fontSize: 11, color: "#888" }}>{cell.subject}</span>
+                      {dayLabs.length > 1 && <span style={{ fontSize: 10, background: "#fff3cd", color: "#856404", borderRadius: 20, padding: "1px 6px" }}>⚠ double</span>}
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                      {cell.batches?.map((b, bi) => (
+                        <div key={bi} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "5px 8px", background: "#fafffe", borderRadius: 6, border: "1px solid #c6f6d5" }}>
+                          <span style={S.batchTag}>{b.batch}</span>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontWeight: 700, fontSize: 11, color: "#276749" }}>{b.subjectName}</div>
+                            <div style={{ display: "flex", gap: 8, marginTop: 2, flexWrap: "wrap" }}>
+                              {b.teacherCode && <span style={{ fontSize: 10, fontFamily: "monospace", color: "#555" }}>{b.teacherCode}</span>}
+                              {b.room && <span style={S.roomBadge}>{b.room}</span>}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Lab Room View ─────────────────────────────────────────────────────────────
+function LabRoomView({ labRoomTTs, teachers, dept, semLabel }) {
+  const roomNumbers = Object.keys(labRoomTTs).sort();
+  const [activeRoom, setActiveRoom] = useState(roomNumbers[0] || null);
+
+  useEffect(() => {
+    if (roomNumbers.length && !activeRoom) setActiveRoom(roomNumbers[0]);
+  }, [roomNumbers]);
+
+  if (!roomNumbers.length) {
+    return <div style={S.emptyBox}>No lab room timetables found. Make sure Core Lab subjects with lab rooms are added and timetable is generated.</div>;
+  }
+
+  return (
+    <div>
+      {/* Room selector */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 20 }}>
+        {roomNumbers.map(rn => (
+          <button key={rn} onClick={() => setActiveRoom(rn)}
+            style={{
+              ...S.tabBtn,
+              ...(activeRoom === rn ? S.tabLabRoomActive : {}),
+              display: "flex", alignItems: "center", gap: 6,
+            }}>
+            <span style={{ fontSize: 16 }}>🔬</span>
+            <span style={{ fontWeight: 700, fontFamily: "monospace" }}>{rn}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Usage summary for selected room */}
+      {activeRoom && labRoomTTs[activeRoom] && (() => {
+        const roomGrid = labRoomTTs[activeRoom];
+        let totalSessions = 0;
+        const daysUsed = new Set();
+        DAYS.forEach(day => SLOTS.forEach(slot => {
+          if (slot !== BREAK_SLOT && roomGrid[day]?.[slot]) {
+            totalSessions++;
+            daysUsed.add(day);
+          }
+        }));
+        return (
+          <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
+            <div style={{ padding: "10px 18px", background: "#e8f5e9", borderRadius: 10, border: "1px solid #9ae6b4", fontSize: 13 }}>
+              <span style={{ fontWeight: 700, color: "#276749", fontSize: 18, marginRight: 6 }}>{totalSessions}</span>
+              <span style={{ color: "#555" }}>Slots Used / Week</span>
+            </div>
+            <div style={{ padding: "10px 18px", background: "#f0f5ff", borderRadius: 10, border: "1px solid #c5d3f5", fontSize: 13 }}>
+              <span style={{ fontWeight: 700, color: "#3451b2", fontSize: 18, marginRight: 6 }}>{daysUsed.size}</span>
+              <span style={{ color: "#555" }}>Days Active</span>
+            </div>
+            <div style={{ padding: "10px 18px", background: "#fff3f0", borderRadius: 10, border: "1px solid #fbb", fontSize: 13 }}>
+              <span style={{ fontWeight: 700, color: "#c53030", fontSize: 18, marginRight: 6 }}>{SLOTS.length - 1 /* minus break */ - totalSessions}</span>
+              <span style={{ color: "#555" }}>Free Slots</span>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Timetable */}
+      {activeRoom && labRoomTTs[activeRoom] && (
+        <>
+          <LabRoomTTTable
+            roomNumber={activeRoom}
+            roomGrid={labRoomTTs[activeRoom]}
+            teachers={teachers}
+            caption={`🔬 Lab Room ${activeRoom}  ·  ${dept}  ·  ${semLabel}`}
+          />
+          <div style={{ marginTop: 14 }}>
+            <button
+              className="card-btn btn-teal"
+              style={{ fontSize: 13, padding: "8px 20px" }}
+              onClick={() => generateLabRoomPDF(activeRoom, labRoomTTs[activeRoom], dept, semLabel, teachers)}
+            >
+              📄 PDF: Lab Room {activeRoom}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN COMPONENT
 // ─────────────────────────────────────────────────────────────────────────────
 export default function GenerateTimetable() {
   const navigate = useNavigate();
 
-  // ── Institution info ──────────────────────────────────────────────────────
   const [dept, setDept] = useState("Department of Information Technology");
   const [semLabel, setSemLabel] = useState("EVEN Semester (IV) 2025-2026");
 
-  // ── Year/Branch/Div setup ─────────────────────────────────────────────────
   const [yearInput, setYearInput] = useState("SE");
   const [branchInput, setBranchInput] = useState("");
   const [divInput, setDivInput] = useState("");
@@ -630,7 +945,6 @@ export default function GenerateTimetable() {
   const [yearBranches, setYearBranches] = useState([]);
   const [ybBatchCount, setYbBatchCount] = useState({});
 
-  // ── Subjects ──────────────────────────────────────────────────────────────
   const [ybSubjects, setYbSubjects] = useState({});
   const [activeSubYbId, setActiveSubYbId] = useState("");
   const [subName, setSubName] = useState("");
@@ -642,7 +956,6 @@ export default function GenerateTimetable() {
   const subNameRef = useRef();
   const getYbSubs = id => ybSubjects[id] || [];
 
-  // ── Rooms ─────────────────────────────────────────────────────────────────
   const [rooms, setRooms] = useState([]);
   const [roomNum, setRoomNum] = useState("");
   const [roomType, setRoomType] = useState("classroom");
@@ -650,19 +963,14 @@ export default function GenerateTimetable() {
   const [roomAssignMode, setRoomAssignMode] = useState({});
   const [ybRoomConfig, setYbRoomConfig] = useState({});
 
-  // ── Teachers ──────────────────────────────────────────────────────────────
   const [teachers, setTeachers] = useState([]);
   const [tCode, setTCode] = useState("");
   const [tName, setTName] = useState("");
   const [tError, setTError] = useState("");
   const [assignments, setAssignments] = useState({});
 
-  // ── FIX 4: Class Counsellor per Division ─────────────────────────────────
-  // divCounsellors: { [ybId]: { [div]: string } }
   const [divCounsellors, setDivCounsellors] = useState({});
 
-  // ── Details / Footer ──────────────────────────────────────────────────────
-  // footerRoles: HOD, Principal (+ custom). Class Counsellor is handled per-div separately.
   const [footerRoles, setFooterRoles] = useState([
     { id: "hod", role: "HOD", name: "", locked: true },
     { id: "principal", role: "Principal", name: "", locked: true },
@@ -670,11 +978,13 @@ export default function GenerateTimetable() {
   const [cfRole, setCfRole] = useState("");
   const [cfName, setCfName] = useState("");
 
-  // ── Generate / View ───────────────────────────────────────────────────────
   const [generating, setGenerating] = useState(false);
   const [generated, setGenerated] = useState(false);
   const [allTimetables, setAllTimetables] = useState({});
   const [teacherTTs, setTeacherTTs] = useState({});
+  const [labRoomTTs, setLabRoomTTs] = useState({});  // NEW
+
+  // viewMode now includes "labroom"
   const [viewMode, setViewMode] = useState("division");
   const [activeYbId, setActiveYbId] = useState(null);
   const [activeDiv, setActiveDiv] = useState(null);
@@ -687,11 +997,9 @@ export default function GenerateTimetable() {
     if (!isCoreLab(subType)) { setSubLabHours("2"); setSubWeeklyLabs("1"); }
   }, [subType]);
 
-  // ── FIX 2: Load saved data including teacher assignments ──────────────────
   useEffect(() => {
     const token = localStorage.getItem("token");
     if (!token) return;
-
     Promise.all([
       apiGet("/teachers").catch(() => []),
       apiGet("/rooms").catch(() => []),
@@ -699,59 +1007,34 @@ export default function GenerateTimetable() {
     ]).then(async ([teacherData, roomData, ybData]) => {
       if (teacherData.length) setTeachers(teacherData.map(t => ({ id: uid(), code: t.code, name: t.name })));
       if (roomData.length) setRooms(roomData.map(rm => ({ id: uid(), number: rm.number, type: rm.type })));
-
       if (!ybData.length) return;
-
       const loadedYBs = ybData.map(yb => ({ id: `${yb.year}-${yb.branch}`, year: yb.year, branch: yb.branch, divs: yb.divs }));
       setYearBranches(loadedYBs);
       setActiveSubYbId(loadedYBs[0].id);
-
-      // Load subjects for each YB
       const subMap = {};
       for (const yb of loadedYBs) {
         try {
           const subs = await apiGet(`/subjects/${encodeURIComponent(yb.id)}`);
-          subMap[yb.id] = subs.map(s => ({
-            id: uid(), name: s.name, type: s.type,
-            hours: s.hours || 0, labHours: s.lab_hours || 2, weeklyLabs: s.weekly_labs || 1
-          }));
+          subMap[yb.id] = subs.map(s => ({ id: uid(), name: s.name, type: s.type, hours: s.hours || 0, labHours: s.lab_hours || 2, weeklyLabs: s.weekly_labs || 1 }));
         } catch { subMap[yb.id] = []; }
       }
       setYbSubjects(subMap);
-
-      // FIX 2: Load saved teacher assignments from backend
-      const newAssignments = {};
-      const newCounsellors = {};
-
+      const newAssignments = {}, newCounsellors = {};
       for (const yb of loadedYBs) {
-        newAssignments[yb.id] = {};
-        newCounsellors[yb.id] = {};
-        yb.divs.forEach(d => {
-          newAssignments[yb.id][d] = {};
-          newCounsellors[yb.id][d] = "";
-        });
-
+        newAssignments[yb.id] = {}; newCounsellors[yb.id] = {};
+        yb.divs.forEach(d => { newAssignments[yb.id][d] = {}; newCounsellors[yb.id][d] = ""; });
         try {
           const savedAssignments = await apiGet(`/assignments/${encodeURIComponent(yb.id)}`);
           const ybSubs = subMap[yb.id] || [];
-
-          // Map saved assignments back to subject IDs
           Object.entries(savedAssignments).forEach(([div, subMap2]) => {
             if (!newAssignments[yb.id][div]) newAssignments[yb.id][div] = {};
             Object.entries(subMap2).forEach(([subName, assignVal]) => {
               const subObj = ybSubs.find(s => s.name === subName);
-              if (subObj) {
-                newAssignments[yb.id][div][subObj.id] = {
-                  teacherCode: assignVal.teacher_code || ""
-                };
-              }
+              if (subObj) newAssignments[yb.id][div][subObj.id] = { teacherCode: assignVal.teacher_code || "" };
             });
           });
-        } catch (e) {
-          // assignments not available, keep empty
-        }
+        } catch {}
       }
-
       setAssignments(newAssignments);
       setDivCounsellors(newCounsellors);
     });
@@ -769,22 +1052,11 @@ export default function GenerateTimetable() {
 
   const getRoomPools = ybId => {
     const mode = roomAssignMode[ybId] || "auto";
-    if (mode === "auto") {
-      return {
-        theory: rooms.filter(r => r.type === "classroom"),
-        elective: rooms.filter(r => r.type === "classroom"),
-        lab: rooms.filter(r => r.type === "lab"),
-      };
-    }
+    if (mode === "auto") return { theory: rooms.filter(r => r.type === "classroom"), elective: rooms.filter(r => r.type === "classroom"), lab: rooms.filter(r => r.type === "lab") };
     const config = ybRoomConfig[ybId] || { theory: [], elective: [], lab: [] };
-    return {
-      theory: rooms.filter(r => (config.theory || []).includes(r.number)),
-      elective: rooms.filter(r => (config.elective || []).includes(r.number)),
-      lab: rooms.filter(r => (config.lab || []).includes(r.number)),
-    };
+    return { theory: rooms.filter(r => (config.theory || []).includes(r.number)), elective: rooms.filter(r => (config.elective || []).includes(r.number)), lab: rooms.filter(r => (config.lab || []).includes(r.number)) };
   };
 
-  // ── ① Setup handlers ──────────────────────────────────────────────────────
   const addYearBranch = async () => {
     setYbError("");
     const year = yearInput.trim().toUpperCase(), branch = branchInput.trim().toUpperCase();
@@ -800,13 +1072,7 @@ export default function GenerateTimetable() {
     setYbBatchCount(p => ({ ...p, [id]: numBatches }));
     const na = {}; divs.forEach(d => { na[d] = {}; });
     setAssignments(p => ({ ...p, [id]: na }));
-    // FIX 4: Initialize counsellors for each division
-    setDivCounsellors(p => {
-      const cur = { ...p };
-      cur[id] = {};
-      divs.forEach(d => { cur[id][d] = ""; });
-      return cur;
-    });
+    setDivCounsellors(p => { const cur = { ...p }; cur[id] = {}; divs.forEach(d => { cur[id][d] = ""; }); return cur; });
     setBranchInput(""); setDivInput(""); setBatchInput("3");
   };
 
@@ -819,7 +1085,6 @@ export default function GenerateTimetable() {
     setActiveSubYbId(p => p === id ? "" : p);
   };
 
-  // ── ② Subject handlers ────────────────────────────────────────────────────
   const addSubject = async () => {
     setSubError("");
     if (!activeSubYbId) { setSubError("Select a Year-Branch first."); return; }
@@ -827,20 +1092,9 @@ export default function GenerateTimetable() {
     const coreLab = isCoreLab(subType);
     if (!coreLab && (!subHours || parseInt(subHours) < 1)) { setSubError("Enter hours/week."); return; }
     if (coreLab && (!subLabHours || !subWeeklyLabs)) { setSubError("Enter lab hours/session and sessions/week."); return; }
-
-    const newSub = {
-      id: uid(), name: subName.trim(), type: subType,
-      hours: coreLab ? 0 : parseInt(subHours),
-      labHours: coreLab ? parseInt(subLabHours) : 0,
-      weeklyLabs: coreLab ? parseInt(subWeeklyLabs) : 0,
-    };
+    const newSub = { id: uid(), name: subName.trim(), type: subType, hours: coreLab ? 0 : parseInt(subHours), labHours: coreLab ? parseInt(subLabHours) : 0, weeklyLabs: coreLab ? parseInt(subWeeklyLabs) : 0 };
     const updated = [...getYbSubs(activeSubYbId), newSub];
-    try {
-      await apiPost("/subjects/bulk", {
-        yb_key: activeSubYbId,
-        subjects: updated.map(s => ({ name: s.name, type: s.type, hours: s.hours, ...(isCoreLab(s.type) ? { lab_hours: s.labHours } : {}) })),
-      });
-    } catch (e) { setApiError(`Save subject failed: ${e.message}`); }
+    try { await apiPost("/subjects/bulk", { yb_key: activeSubYbId, subjects: updated.map(s => ({ name: s.name, type: s.type, hours: s.hours, ...(isCoreLab(s.type) ? { lab_hours: s.labHours } : {}) })) }); } catch (e) { setApiError(`Save subject failed: ${e.message}`); }
     setYbSubjects(p => ({ ...p, [activeSubYbId]: updated }));
     setSubName(""); setSubHours(""); setSubLabHours("2"); setSubWeeklyLabs("1");
     subNameRef.current?.focus();
@@ -848,12 +1102,10 @@ export default function GenerateTimetable() {
 
   const removeSubject = async (ybId, id) => {
     const updated = getYbSubs(ybId).filter(s => s.id !== id);
-    try { await apiPost("/subjects/bulk", { yb_key: ybId, subjects: updated.map(s => ({ name: s.name, type: s.type, hours: s.hours, ...(isCoreLab(s.type) ? { lab_hours: s.labHours } : {}) })) }); }
-    catch (e) { setApiError(`Remove failed: ${e.message}`); return; }
+    try { await apiPost("/subjects/bulk", { yb_key: ybId, subjects: updated.map(s => ({ name: s.name, type: s.type, hours: s.hours, ...(isCoreLab(s.type) ? { lab_hours: s.labHours } : {}) })) }); } catch (e) { setApiError(`Remove failed: ${e.message}`); return; }
     setYbSubjects(p => ({ ...p, [ybId]: updated }));
   };
 
-  // ── ③ Room handlers ───────────────────────────────────────────────────────
   const addRoom = async () => {
     setRoomError("");
     const num = roomNum.trim();
@@ -867,21 +1119,14 @@ export default function GenerateTimetable() {
   const removeRoom = async id => {
     const room = rooms.find(r => r.id === id);
     if (!room) return;
-    try { const token = localStorage.getItem("token"); await fetch(`${API_BASE}/rooms/${encodeURIComponent(room.number)}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }); }
-    catch (e) { setApiError(`Remove room failed: ${e.message}`); return; }
+    try { const token = localStorage.getItem("token"); await fetch(`${API_BASE}/rooms/${encodeURIComponent(room.number)}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }); } catch (e) { setApiError(`Remove room failed: ${e.message}`); return; }
     setRooms(p => p.filter(r => r.id !== id));
   };
 
   const toggleRoomInPool = (ybId, poolKey, roomNumber) => {
-    setYbRoomConfig(p => {
-      const cur = p[ybId] || { theory: [], elective: [], lab: [] };
-      const pool = cur[poolKey] || [];
-      const updated = pool.includes(roomNumber) ? pool.filter(r => r !== roomNumber) : [...pool, roomNumber];
-      return { ...p, [ybId]: { ...cur, [poolKey]: updated } };
-    });
+    setYbRoomConfig(p => { const cur = p[ybId] || { theory: [], elective: [], lab: [] }; const pool = cur[poolKey] || []; const updated = pool.includes(roomNumber) ? pool.filter(r => r !== roomNumber) : [...pool, roomNumber]; return { ...p, [ybId]: { ...cur, [poolKey]: updated } }; });
   };
 
-  // ── ④ Teacher handlers ────────────────────────────────────────────────────
   const addTeacher = async () => {
     setTError("");
     const code = tCode.trim().toUpperCase(), name = tName.trim();
@@ -895,46 +1140,25 @@ export default function GenerateTimetable() {
   const removeTeacher = async id => {
     const teacher = teachers.find(t => t.id === id);
     if (!teacher) return;
-    try { const token = localStorage.getItem("token"); await fetch(`${API_BASE}/teachers/${encodeURIComponent(teacher.code)}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }); }
-    catch (e) { setApiError(`Remove teacher failed: ${e.message}`); return; }
+    try { const token = localStorage.getItem("token"); await fetch(`${API_BASE}/teachers/${encodeURIComponent(teacher.code)}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }); } catch (e) { setApiError(`Remove teacher failed: ${e.message}`); return; }
     setTeachers(p => p.filter(t => t.id !== id));
   };
 
   const setSubjectTeacher = (ybId, div, subId, teacherCode) =>
-    setAssignments(p => ({
-      ...p, [ybId]: { ...p[ybId], [div]: { ...p[ybId]?.[div], [subId]: { ...(p[ybId]?.[div]?.[subId] || {}), teacherCode } } }
-    }));
+    setAssignments(p => ({ ...p, [ybId]: { ...p[ybId], [div]: { ...p[ybId]?.[div], [subId]: { ...(p[ybId]?.[div]?.[subId] || {}), teacherCode } } } }));
 
-  // FIX 4: Set counsellor per division
-  const setDivCounsellor = (ybId, div, teacherCode) => {
-    setDivCounsellors(p => ({
-      ...p,
-      [ybId]: { ...(p[ybId] || {}), [div]: teacherCode }
-    }));
-  };
+  const setDivCounsellor = (ybId, div, teacherCode) => setDivCounsellors(p => ({ ...p, [ybId]: { ...(p[ybId] || {}), [div]: teacherCode } }));
 
-  // ── ⑤ Footer / Details handlers ───────────────────────────────────────────
-  const updateFooterRole = (id, field, value) =>
-    setFooterRoles(p => p.map(r => r.id === id ? { ...r, [field]: value } : r));
-
-  const addCustomFooterRole = () => {
-    if (!cfRole.trim() || !cfName.trim()) return;
-    setFooterRoles(p => [...p, { id: uid(), role: cfRole.trim(), name: cfName.trim() }]);
-    setCfRole(""); setCfName("");
-  };
-
+  const updateFooterRole = (id, field, value) => setFooterRoles(p => p.map(r => r.id === id ? { ...r, [field]: value } : r));
+  const addCustomFooterRole = () => { if (!cfRole.trim() || !cfName.trim()) return; setFooterRoles(p => [...p, { id: uid(), role: cfRole.trim(), name: cfName.trim() }]); setCfRole(""); setCfName(""); };
   const removeFooterRole = id => setFooterRoles(p => p.filter(r => r.id !== id));
 
-  // Build footer roles for a specific division (includes per-div counsellor)
   const getFooterRolesForDiv = (ybId, div) => {
     const counsellorCode = divCounsellors?.[ybId]?.[div] || "";
     const counsellorTeacher = teachers.find(t => t.code === counsellorCode);
     const counsellorName = counsellorTeacher?.name || counsellorCode || "";
-
     const roles = [];
-    if (counsellorName) {
-      roles.push({ id: `cc-${div}`, role: `Class Counsellor (Div ${div})`, name: counsellorName });
-    }
+    if (counsellorName) roles.push({ id: `cc-${div}`, role: `Class Counsellor (Div ${div})`, name: counsellorName });
     roles.push(...footerRoles);
     return roles;
   };
@@ -947,6 +1171,8 @@ export default function GenerateTimetable() {
     setGenerating(true);
 
     const newAllTT = {};
+    const globalLabSlots = {};
+
     yearBranches.forEach(yb => {
       const subs = getYbSubs(yb.id);
       if (!subs.length) return;
@@ -959,12 +1185,16 @@ export default function GenerateTimetable() {
           const a = assignments?.[yb.id]?.[div]?.[sub.id] || {};
           divAssign[sub.id] = { teacherCode: a.teacherCode || "" };
         });
-        newAllTT[yb.id][div] = generateTimetable(subs, divAssign, roomPools, numBatches, div);
+        newAllTT[yb.id][div] = generateTimetable(subs, divAssign, roomPools, numBatches, div, globalLabSlots);
       });
     });
 
+    const newLabRoomTTs = buildLabRoomTTs(newAllTT);  // NEW
+
     setAllTimetables(newAllTT);
     setTeacherTTs(buildTeacherTTs(newAllTT, teachers));
+    setLabRoomTTs(newLabRoomTTs);  // NEW
+
     if (yearBranches.length) { setActiveYbId(yearBranches[0].id); setActiveDiv(yearBranches[0].divs[0]); }
     if (teachers.length) setActiveTeacher(teachers[0].code);
     setGenerated(true); setActiveTab(5);
@@ -1022,17 +1252,12 @@ export default function GenerateTimetable() {
         } else if (cell?.electives?.length) {
           sr.push(cell.subject);
           tc.push(cell.electives.map(e => `${e.name}:${e.teacherCode || "—"}`).join(" | "));
-          rm.push(cell.electives.map(e => e.room || "—").join(" | "));
-        } else {
-          sr.push(cell?.subject || "");
-          tc.push(cell?.teacherCode || "");
-          rm.push(cell?.room || "");
-        }
+          rm.push(cell.electives.map(e => `${e.name}:${e.room || "—"}`).join(" | "));
+        } else { sr.push(cell?.subject || ""); tc.push(cell?.teacherCode || ""); rm.push(cell?.room || ""); }
       });
       aoa.push(sr); aoa.push(tc); aoa.push(rm); aoa.push([]);
     });
     aoa.push([]);
-
     const seen = new Set(); let n = 1;
     aoa.push([null, null, "Sr. No.", "Subject", "Faculty Code", "Faculty Name", "Room/Lab"]);
     DAYS.forEach(day => SLOTS.forEach(slot => {
@@ -1044,31 +1269,19 @@ export default function GenerateTimetable() {
         cell.batches.forEach(b => {
           if (shownSubs.has(b.subjectName)) return;
           shownSubs.add(b.subjectName);
+          // FIX: use b.teacherCode for lookup
           const tO = teachers.find(t => t.code === b.teacherCode);
           aoa.push([null, null, n++, b.subjectName, b.teacherCode || "", tO?.name || "", b.room || ""]);
         });
       } else if (cell.electives?.length) {
         cell.electives.forEach(e => { const tO = teachers.find(t => t.code === e.teacherCode); aoa.push([null, null, n++, e.name, e.teacherCode || "", tO?.name || "", e.room || ""]); });
-      } else {
-        const tO = teachers.find(t => t.code === cell.teacherCode);
-        aoa.push([null, null, n++, cell.subject, cell.teacherCode || "", tO?.name || "", cell.room || ""]);
-      }
+      } else { const tO = teachers.find(t => t.code === cell.teacherCode); aoa.push([null, null, n++, cell.subject, cell.teacherCode || "", tO?.name || "", cell.room || ""]); }
     }));
-
     aoa.push([]);
-
-    // Footer with per-div counsellor
     const activeRoles = activeFooterRoles.filter(r => r.role && r.name);
-    const roleRow = [null, null];
-    const nameRow = [null, null];
-    activeRoles.forEach((r, i) => {
-      if (i > 0) { roleRow.push(null, null); nameRow.push(null, null); }
-      roleRow.push(r.role);
-      nameRow.push(r.name);
-    });
-    aoa.push(roleRow);
-    aoa.push(nameRow);
-
+    const roleRow = [null, null], nameRow = [null, null];
+    activeRoles.forEach((r, i) => { if (i > 0) { roleRow.push(null, null); nameRow.push(null, null); } roleRow.push(r.role); nameRow.push(r.name); });
+    aoa.push(roleRow); aoa.push(nameRow);
     const ws = XLSX.utils.aoa_to_sheet(aoa);
     ws["!cols"] = [{ wch: 2 }, { wch: 2 }, { wch: 14 }, ...SLOTS.map(() => ({ wch: 24 }))];
     return ws;
@@ -1096,6 +1309,34 @@ export default function GenerateTimetable() {
     return ws;
   };
 
+  // NEW: Build lab room sheet for Excel
+  const buildLabRoomSheet = (roomNumber, roomGrid) => {
+    const aoa = [];
+    aoa.push([null, null, dept]);
+    aoa.push([null, null, `Lab Room Timetable – ${roomNumber}`]);
+    aoa.push([null, null, semLabel]);
+    aoa.push([null, null, "Day/Time", ...SLOTS.map(s => SLOT_LBL[s])]);
+    aoa.push([]);
+    DAYS.forEach(day => {
+      const subRow = [null, null, DAY_SHORT[day]];
+      const tcRow = [null, null, "Faculty"];
+      const divRow = [null, null, "Div/Batch"];
+      SLOTS.forEach(slot => {
+        if (slot === BREAK_SLOT) { subRow.push("BREAK"); tcRow.push(null); divRow.push(null); return; }
+        const entry = roomGrid[day]?.[slot];
+        if (!entry) { subRow.push(""); tcRow.push(""); divRow.push(""); return; }
+        const tO = teachers.find(t => t.code === entry.teacherCode);
+        subRow.push(`${entry.batch}: ${entry.subjectName}`);
+        tcRow.push(tO?.name || entry.teacherCode || "");
+        divRow.push(`${entry.ybLabel}/Div${entry.div}`);
+      });
+      aoa.push(subRow); aoa.push(tcRow); aoa.push(divRow); aoa.push([]);
+    });
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws["!cols"] = [{ wch: 2 }, { wch: 2 }, { wch: 14 }, ...SLOTS.map(() => ({ wch: 26 }))];
+    return ws;
+  };
+
   const downloadAll = () => {
     const wb = XLSX.utils.book_new();
     yearBranches.forEach(yb => yb.divs.forEach(div => {
@@ -1103,6 +1344,11 @@ export default function GenerateTimetable() {
       if (grid) XLSX.utils.book_append_sheet(wb, buildSheet(grid, yb.id, div, yb.id), `${yb.id}-${div}`.slice(0, 31));
     }));
     teachers.forEach(t => { const ws = buildTeacherSheet(t.code); if (ws) XLSX.utils.book_append_sheet(wb, ws, `T-${t.code.replace(/[/\s]+/g, "_")}`.slice(0, 31)); });
+    // NEW: Add lab room sheets
+    Object.entries(labRoomTTs).forEach(([roomNum, roomGrid]) => {
+      const ws = buildLabRoomSheet(roomNum, roomGrid);
+      if (ws) XLSX.utils.book_append_sheet(wb, ws, `Lab-${roomNum.replace(/[/\s]+/g, "_")}`.slice(0, 31));
+    });
     XLSX.writeFile(wb, `Timetables_${dept.replace(/\s+/g, "_")}.xlsx`);
   };
 
@@ -1118,13 +1364,13 @@ export default function GenerateTimetable() {
   const currentYB = yearBranches.find(yb => yb.id === activeYbId);
   const classroomPool = rooms.filter(r => r.type === "classroom");
   const labPool = rooms.filter(r => r.type === "lab");
-
   const getLabSubs = ybId => getYbSubs(ybId).filter(s => isCoreLab(s.type));
   const getTheoryAndElective = ybId => getYbSubs(ybId).filter(s => !isCoreLab(s.type));
 
   return (
     <Layout>
       <h2 className="page-title" style={{ marginBottom: 4 }}>Generate Timetable</h2>
+
       {apiError && <div className="banner banner-error" style={{ marginBottom: 14 }}>⚠️ {apiError}</div>}
       {apiSuccess && <div className="banner banner-info" style={{ marginBottom: 14 }}>{apiSuccess}</div>}
 
@@ -1204,7 +1450,7 @@ export default function GenerateTimetable() {
           {yearBranches.length > 0 && (
             <>
               <p style={S.hint}>
-                <strong>Core Lab 1, 2, 3</strong> are grouped into a rotation schedule — each session, every batch does a different lab. All three share the same time slot.
+                <strong>Core Lab 1, 2, 3</strong> are grouped into a rotation schedule — each session, every batch does a different lab. All three share the same time slot. Labs will be spread across different days (max 1 lab/day, 2 only as last resort).
               </p>
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 18 }}>
                 {yearBranches.map(yb => (
@@ -1230,23 +1476,13 @@ export default function GenerateTimetable() {
                         <div style={{ fontWeight: 700, fontSize: 12, color: "#276749", marginBottom: 8 }}>🔄 Core Lab Rotation Preview (Div A)</div>
                         <div style={{ overflowX: "auto" }}>
                           <table style={{ fontSize: 11, borderCollapse: "collapse" }}>
-                            <thead>
-                              <tr>
-                                <th style={{ padding: "4px 10px", background: "#276749", color: "#fff" }}>Lab Session</th>
-                                {batches.map(b => <th key={b} style={{ padding: "4px 10px", background: "#276749", color: "#fff" }}>{b}</th>)}
+                            <thead><tr><th style={{ padding: "4px 10px", background: "#276749", color: "#fff" }}>Lab Session</th>{batches.map(b => <th key={b} style={{ padding: "4px 10px", background: "#276749", color: "#fff" }}>{b}</th>)}</tr></thead>
+                            <tbody>{Array.from({ length: maxSessions }, (_, si) => (
+                              <tr key={si} style={{ background: si % 2 === 0 ? "#f0fff4" : "#fff" }}>
+                                <td style={{ padding: "4px 10px", fontWeight: 700 }}>Session {si + 1}</td>
+                                {batches.map((b, bi) => { const subIdx = (bi + si) % labSubs.length; return <td key={b} style={{ padding: "4px 10px" }}>{labSubs[subIdx]?.name || "—"}</td>; })}
                               </tr>
-                            </thead>
-                            <tbody>
-                              {Array.from({ length: maxSessions }, (_, si) => (
-                                <tr key={si} style={{ background: si % 2 === 0 ? "#f0fff4" : "#fff" }}>
-                                  <td style={{ padding: "4px 10px", fontWeight: 700 }}>Session {si + 1}</td>
-                                  {batches.map((b, bi) => {
-                                    const subIdx = (bi + si) % labSubs.length;
-                                    return <td key={b} style={{ padding: "4px 10px" }}>{labSubs[subIdx]?.name || "—"}</td>;
-                                  })}
-                                </tr>
-                              ))}
-                            </tbody>
+                            ))}</tbody>
                           </table>
                         </div>
                         <div style={{ fontSize: 11, color: "#555", marginTop: 8 }}>
@@ -1259,10 +1495,7 @@ export default function GenerateTimetable() {
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 6 }}>
                     <div style={{ flex: 2, minWidth: 160 }}>
                       <label style={S.label}>Subject Name</label>
-                      <input ref={subNameRef} type="text" value={subName}
-                        onChange={e => { setSubName(e.target.value); setSubError(""); }}
-                        onKeyDown={e => e.key === "Enter" && addSubject()} placeholder="e.g. OS, DBMS, SBL-PY"
-                        style={{ ...S.input, borderColor: subError ? "#e05c5c" : "#d0d5dd" }} />
+                      <input ref={subNameRef} type="text" value={subName} onChange={e => { setSubName(e.target.value); setSubError(""); }} onKeyDown={e => e.key === "Enter" && addSubject()} placeholder="e.g. OS, DBMS, SBL-PY" style={{ ...S.input, borderColor: subError ? "#e05c5c" : "#d0d5dd" }} />
                     </div>
                     <div style={{ flex: 1, minWidth: 170 }}>
                       <label style={S.label}>Type</label>
@@ -1281,27 +1514,18 @@ export default function GenerateTimetable() {
                     {!isCoreLab(subType) && (
                       <div style={{ flex: "0 0 100px" }}>
                         <label style={S.label}>Hrs / Week</label>
-                        <input type="number" min={1} max={10} value={subHours}
-                          onChange={e => { setSubHours(e.target.value); setSubError(""); }}
-                          onKeyDown={e => e.key === "Enter" && addSubject()} placeholder="3"
-                          style={{ ...S.input, borderColor: subError ? "#e05c5c" : "#d0d5dd" }} />
+                        <input type="number" min={1} max={10} value={subHours} onChange={e => { setSubHours(e.target.value); setSubError(""); }} onKeyDown={e => e.key === "Enter" && addSubject()} placeholder="3" style={{ ...S.input, borderColor: subError ? "#e05c5c" : "#d0d5dd" }} />
                       </div>
                     )}
                     {isCoreLab(subType) && (
                       <>
                         <div style={{ flex: "0 0 130px" }}>
                           <label style={S.label}>Lab Hrs / Session</label>
-                          <input type="number" min={1} max={6} value={subLabHours}
-                            onChange={e => { setSubLabHours(e.target.value); setSubError(""); }}
-                            onKeyDown={e => e.key === "Enter" && addSubject()} placeholder="2"
-                            style={{ ...S.input, borderColor: "#6c8ebf", background: "#f0f5ff" }} />
+                          <input type="number" min={1} max={6} value={subLabHours} onChange={e => { setSubLabHours(e.target.value); setSubError(""); }} onKeyDown={e => e.key === "Enter" && addSubject()} placeholder="2" style={{ ...S.input, borderColor: "#6c8ebf", background: "#f0f5ff" }} />
                         </div>
                         <div style={{ flex: "0 0 130px" }}>
                           <label style={S.label}>Sessions / Week</label>
-                          <input type="number" min={1} max={5} value={subWeeklyLabs}
-                            onChange={e => { setSubWeeklyLabs(e.target.value); setSubError(""); }}
-                            onKeyDown={e => e.key === "Enter" && addSubject()} placeholder="3"
-                            style={{ ...S.input, borderColor: "#6c8ebf", background: "#f0f5ff" }} />
+                          <input type="number" min={1} max={5} value={subWeeklyLabs} onChange={e => { setSubWeeklyLabs(e.target.value); setSubError(""); }} onKeyDown={e => e.key === "Enter" && addSubject()} placeholder="3" style={{ ...S.input, borderColor: "#6c8ebf", background: "#f0f5ff" }} />
                         </div>
                       </>
                     )}
@@ -1322,11 +1546,9 @@ export default function GenerateTimetable() {
                             <tbody>
                               {getLabSubs(activeSubYbId).map((s, i) => (
                                 <tr key={s.id} style={{ background: i % 2 === 0 ? "#f0fff4" : "#fff" }}>
-                                  <td style={S.td}>{i + 1}</td>
-                                  <td style={{ ...S.td, fontWeight: 600 }}>{s.name}</td>
+                                  <td style={S.td}>{i + 1}</td><td style={{ ...S.td, fontWeight: 600 }}>{s.name}</td>
                                   <td style={S.td}><span className="chip-teal" style={{ fontSize: 11 }}>{s.type}</span></td>
-                                  <td style={S.td}>{s.labHours}</td>
-                                  <td style={S.td}>{s.weeklyLabs}</td>
+                                  <td style={S.td}>{s.labHours}</td><td style={S.td}>{s.weeklyLabs}</td>
                                   <td style={S.td}><button onClick={() => removeSubject(activeSubYbId, s.id)} style={S.removeBtn}>✕</button></td>
                                 </tr>
                               ))}
@@ -1340,8 +1562,7 @@ export default function GenerateTimetable() {
                           <tbody>
                             {getTheoryAndElective(activeSubYbId).map((s, i) => (
                               <tr key={s.id} style={{ background: i % 2 === 0 ? "#fafbff" : "#fff" }}>
-                                <td style={S.td}>{i + 1}</td>
-                                <td style={{ ...S.td, fontWeight: 600 }}>{s.name}</td>
+                                <td style={S.td}>{i + 1}</td><td style={{ ...S.td, fontWeight: 600 }}>{s.name}</td>
                                 <td style={S.td}><span className={isElectiveType(s.type) ? "chip-blue" : "chip-pink"} style={{ fontSize: 11 }}>{s.type}</span></td>
                                 <td style={S.td}>{s.hours}</td>
                                 <td style={S.td}><button onClick={() => removeSubject(activeSubYbId, s.id)} style={S.removeBtn}>✕</button></td>
@@ -1371,9 +1592,7 @@ export default function GenerateTimetable() {
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 6 }}>
               <div style={{ flex: 1, minWidth: 140 }}>
                 <label style={S.label}>Room / Lab Number</label>
-                <input type="text" value={roomNum} onChange={e => { setRoomNum(e.target.value); setRoomError(""); }}
-                  onKeyDown={e => e.key === "Enter" && addRoom()} placeholder="e.g. 604, 308A"
-                  style={{ ...S.input, borderColor: roomError ? "#e05c5c" : "#d0d5dd" }} />
+                <input type="text" value={roomNum} onChange={e => { setRoomNum(e.target.value); setRoomError(""); }} onKeyDown={e => e.key === "Enter" && addRoom()} placeholder="e.g. 604, 308A" style={{ ...S.input, borderColor: roomError ? "#e05c5c" : "#d0d5dd" }} />
               </div>
               <div style={{ flex: "0 0 220px" }}>
                 <label style={S.label}>Room Type</label>
@@ -1484,10 +1703,7 @@ export default function GenerateTimetable() {
 
           <div className="panel" style={{ marginBottom: 20 }}>
             <div className="panel-header"><span className="panel-title">Assign Teachers to Subjects</span></div>
-            <p style={S.hint}>
-              For <strong>Core Lab subjects</strong>, assign the teacher who teaches that lab subject — the rotation ensures each batch gets the right teacher automatically.
-            </p>
-
+            <p style={S.hint}>For <strong>Core Lab subjects</strong>, assign the teacher who teaches that lab subject — the rotation ensures each batch gets the right teacher automatically.</p>
             {yearBranches.map(yb => {
               const subs = getYbSubs(yb.id);
               if (!subs.length) return null;
@@ -1499,13 +1715,9 @@ export default function GenerateTimetable() {
                     <strong>{yb.year}-{yb.branch}</strong>
                     <span style={{ fontSize: 11, color: "#888", marginLeft: 8 }}>Divs: {yb.divs.join(", ")} · {subs.length} subjects · {getNumBatches(yb.id)} batches</span>
                   </div>
-
-                  {/* Core Lab group */}
                   {labSubs.length > 0 && (
                     <div style={{ marginBottom: 16, border: "1.5px solid #9ae6b4", borderRadius: 8, overflow: "visible" }}>
-                      <div style={{ background: "#e8f5e9", padding: "8px 14px", fontWeight: 700, fontSize: 12, color: "#276749" }}>
-                        🔬 Core Lab Group — Teacher per Lab Subject
-                      </div>
+                      <div style={{ background: "#e8f5e9", padding: "8px 14px", fontWeight: 700, fontSize: 12, color: "#276749" }}>🔬 Core Lab Group — Teacher per Lab Subject</div>
                       <div style={{ padding: "12px 14px", overflow: "visible" }}>
                         {labSubs.map(sub => (
                           <div key={sub.id} style={{ marginBottom: 14 }}>
@@ -1517,12 +1729,7 @@ export default function GenerateTimetable() {
                               {yb.divs.map(div => (
                                 <div key={div} style={{ flex: 1, minWidth: 200, position: "relative" }}>
                                   <label style={{ ...S.label, marginBottom: 4 }}>Division {div}</label>
-                                  <TeacherSelect
-                                    value={assignments?.[yb.id]?.[div]?.[sub.id]?.teacherCode || ""}
-                                    onChange={v => setSubjectTeacher(yb.id, div, sub.id, v)}
-                                    teachers={teachers}
-                                    placeholder="— assign teacher —"
-                                  />
+                                  <TeacherSelect value={assignments?.[yb.id]?.[div]?.[sub.id]?.teacherCode || ""} onChange={v => setSubjectTeacher(yb.id, div, sub.id, v)} teachers={teachers} placeholder="— assign teacher —" />
                                 </div>
                               ))}
                             </div>
@@ -1531,8 +1738,6 @@ export default function GenerateTimetable() {
                       </div>
                     </div>
                   )}
-
-                  {/* Theory & Electives */}
                   {otherSubs.map(sub => (
                     <div key={sub.id} style={{ marginBottom: 10, border: "1px solid #e2e8f0", borderRadius: 8, overflow: "visible" }}>
                       <div style={{ padding: "8px 14px", background: isElectiveType(sub.type) ? "#fffbf0" : "#f1f5ff", display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid #e2e8f0" }}>
@@ -1544,8 +1749,7 @@ export default function GenerateTimetable() {
                           <thead><tr>{yb.divs.map(div => <th key={div} style={{ ...S.th, minWidth: 180 }}>Division {div}</th>)}</tr></thead>
                           <tbody><tr>{yb.divs.map(div => (
                             <td key={div} style={{ ...S.td, padding: 10, verticalAlign: "top", overflow: "visible", position: "relative" }}>
-                              <TeacherSelect value={assignments?.[yb.id]?.[div]?.[sub.id]?.teacherCode || ""}
-                                onChange={v => setSubjectTeacher(yb.id, div, sub.id, v)} teachers={teachers} />
+                              <TeacherSelect value={assignments?.[yb.id]?.[div]?.[sub.id]?.teacherCode || ""} onChange={v => setSubjectTeacher(yb.id, div, sub.id, v)} teachers={teachers} />
                             </td>
                           ))}</tr></tbody>
                         </table>
@@ -1564,16 +1768,13 @@ export default function GenerateTimetable() {
         </>
       )}
 
-      {/* ════ TAB 4 — DETAILS (Footer Roles + Per-Division Counsellor) ═════ */}
+      {/* ════ TAB 4 — DETAILS ═══════════════════════════════════════════════ */}
       {activeTab === 4 && (
         <>
-          {/* FIX 4: Class Counsellor per Division */}
           {yearBranches.length > 0 && (
             <div className="panel" style={{ marginBottom: 20 }}>
               <div className="panel-header"><span className="panel-title">🎓 Class Counsellors — Per Division</span></div>
-              <p style={S.hint}>
-                Each division has its own Class Counsellor. Select the assigned teacher for each division below.
-              </p>
+              <p style={S.hint}>Each division has its own Class Counsellor. Select the assigned teacher for each division below.</p>
               {yearBranches.map(yb => (
                 <div key={yb.id} style={{ marginBottom: 20 }}>
                   <div style={S.ybHeader}><strong>{yb.year}-{yb.branch}</strong></div>
@@ -1584,30 +1785,19 @@ export default function GenerateTimetable() {
                           <div style={{ fontWeight: 700, fontSize: 12, color: "#334" }}>Class Counsellor</div>
                           <div style={{ fontSize: 11, color: "#667eea", marginTop: 2 }}>Division {div}</div>
                         </div>
-                        <TeacherSelect
-                          value={divCounsellors?.[yb.id]?.[div] || ""}
-                          onChange={v => setDivCounsellor(yb.id, div, v)}
-                          teachers={teachers}
-                          placeholder="— select counsellor —"
-                        />
+                        <TeacherSelect value={divCounsellors?.[yb.id]?.[div] || ""} onChange={v => setDivCounsellor(yb.id, div, v)} teachers={teachers} placeholder="— select counsellor —" />
                       </div>
                     ))}
                   </div>
                 </div>
               ))}
-              {!teachers.length && (
-                <div style={S.emptyBox}>Add teachers in Step ④ first to assign counsellors.</div>
-              )}
+              {!teachers.length && <div style={S.emptyBox}>Add teachers in Step ④ first to assign counsellors.</div>}
             </div>
           )}
 
           <div className="panel" style={{ marginBottom: 20 }}>
-            <div className="panel-header"><span className="panel-title">Timetable Footer — Signature Roles (Common to All Divisions)</span></div>
-            <p style={S.hint}>
-              These roles (HOD, Principal, and any custom roles) appear on <strong>all</strong> timetable footers.
-              The Class Counsellor above is division-specific and will be added automatically per division.
-            </p>
-
+            <div className="panel-header"><span className="panel-title">Timetable Footer — Signature Roles</span></div>
+            <p style={S.hint}>These roles (HOD, Principal, and any custom roles) appear on <strong>all</strong> timetable footers. The Class Counsellor above is division-specific.</p>
             <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 20 }}>
               {footerRoles.map(r => (
                 <div key={r.id} style={{ flex: 1, minWidth: 200, padding: "12px 14px", border: "1px solid #e2e8f0", borderRadius: 8, background: "#fafbff" }}>
@@ -1615,62 +1805,21 @@ export default function GenerateTimetable() {
                     <div style={{ fontWeight: 700, fontSize: 12, color: "#334" }}>{r.role || "Role"}</div>
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                    {!r.locked && (
-                      <div>
-                        <label style={S.label}>Role / Title</label>
-                        <input type="text" value={r.role} onChange={e => updateFooterRole(r.id, "role", e.target.value)} style={S.input} placeholder="e.g. Lab In-charge" />
-                      </div>
-                    )}
-                    <div>
-                      <label style={S.label}>Name</label>
-                      <input type="text" value={r.name} onChange={e => updateFooterRole(r.id, "name", e.target.value)} style={S.input} placeholder="e.g. Dr. Priya Sharma" />
-                    </div>
-                    {!r.locked && (
-                      <button onClick={() => removeFooterRole(r.id)} style={{ ...S.removeBtn, fontSize: 12, textAlign: "left" }}>✕ Remove</button>
-                    )}
+                    {!r.locked && (<div><label style={S.label}>Role / Title</label><input type="text" value={r.role} onChange={e => updateFooterRole(r.id, "role", e.target.value)} style={S.input} placeholder="e.g. Lab In-charge" /></div>)}
+                    <div><label style={S.label}>Name</label><input type="text" value={r.name} onChange={e => updateFooterRole(r.id, "name", e.target.value)} style={S.input} placeholder="e.g. Dr. Priya Sharma" /></div>
+                    {!r.locked && (<button onClick={() => removeFooterRole(r.id)} style={{ ...S.removeBtn, fontSize: 12, textAlign: "left" }}>✕ Remove</button>)}
                   </div>
                 </div>
               ))}
             </div>
-
             <div style={{ padding: "14px 16px", border: "1px dashed #c8d5ea", borderRadius: 8, background: "#f7f8ff" }}>
               <div style={{ fontWeight: 600, fontSize: 13, color: "#445", marginBottom: 10 }}>+ Add Custom Role</div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
-                <div style={{ flex: 1, minWidth: 160 }}>
-                  <label style={S.label}>Role / Title</label>
-                  <input type="text" value={cfRole} onChange={e => setCfRole(e.target.value)} style={S.input} placeholder="e.g. Lab In-charge, Time Table Incharge" />
-                </div>
-                <div style={{ flex: 2, minWidth: 200 }}>
-                  <label style={S.label}>Name</label>
-                  <input type="text" value={cfName} onChange={e => setCfName(e.target.value)} style={S.input} placeholder="e.g. Prof. Rajan Mehta" onKeyDown={e => e.key === "Enter" && addCustomFooterRole()} />
-                </div>
+                <div style={{ flex: 1, minWidth: 160 }}><label style={S.label}>Role / Title</label><input type="text" value={cfRole} onChange={e => setCfRole(e.target.value)} style={S.input} placeholder="e.g. Lab In-charge" /></div>
+                <div style={{ flex: 2, minWidth: 200 }}><label style={S.label}>Name</label><input type="text" value={cfName} onChange={e => setCfName(e.target.value)} style={S.input} placeholder="e.g. Prof. Rajan Mehta" onKeyDown={e => e.key === "Enter" && addCustomFooterRole()} /></div>
                 <button className="card-btn btn-teal" style={{ ...S.addBtn, alignSelf: "flex-end" }} onClick={addCustomFooterRole}>+ Add</button>
               </div>
             </div>
-
-            {/* Preview */}
-            {(footerRoles.some(r => r.name) || yearBranches.some(yb => yb.divs.some(d => divCounsellors?.[yb.id]?.[d]))) && (
-              <div style={{ marginTop: 20 }}>
-                <div style={{ fontSize: 12, fontWeight: 700, color: "#445", marginBottom: 8 }}>
-                  Preview (e.g. Division {yearBranches[0]?.divs[0] || "A"}):
-                </div>
-                <div style={{ display: "flex", gap: 40, padding: "12px 0", borderTop: "2px solid #e2e8f0", flexWrap: "wrap" }}>
-                  {yearBranches[0] && (() => {
-                    const previewDiv = yearBranches[0].divs[0];
-                    const previewRoles = getFooterRolesForDiv(yearBranches[0].id, previewDiv);
-                    return previewRoles.filter(r => r.name).map(r => (
-                      <div key={r.id} style={{ textAlign: "center", minWidth: 120 }}>
-                        <div style={{ height: 28 }}></div>
-                        <div style={{ borderTop: "1.5px solid #888", paddingTop: 4 }}>
-                          <div style={{ fontWeight: 700, fontSize: 11, color: "#334" }}>{r.role}</div>
-                          <div style={{ fontSize: 11, color: "#555", marginTop: 2 }}>{r.name}</div>
-                        </div>
-                      </div>
-                    ));
-                  })()}
-                </div>
-              </div>
-            )}
           </div>
 
           <div style={{ display: "flex", justifyContent: "space-between" }}>
@@ -1708,14 +1857,35 @@ export default function GenerateTimetable() {
           {generated && Object.keys(allTimetables).length > 0 && (
             <div className="panel" style={{ marginBottom: 40 }}>
               <div className="panel-header"><span className="panel-title">📋 Generated Timetables</span></div>
+
+              {/* Four view modes */}
               <div style={{ display: "flex", gap: 8, margin: "14px 0 20px", flexWrap: "wrap" }}>
-                {["division", "teacher"].map(mode => (
-                  <button key={mode} onClick={() => setViewMode(mode)} style={{ ...S.tabBtn, ...(viewMode === mode ? S.tabActive : {}) }}>
-                    {mode === "division" ? "📅 Division View" : "👤 Teacher View"}
+                {[
+                  { key: "division", label: "📅 Division View" },
+                  { key: "lab", label: "🔬 Lab Schedule" },
+                  { key: "labroom", label: "🏢 Lab Room View" },
+                  { key: "teacher", label: "👤 Teacher View" },
+                ].map(({ key, label }) => (
+                  <button key={key} onClick={() => setViewMode(key)}
+                    style={{
+                      ...S.tabBtn,
+                      ...(viewMode === key
+                        ? key === "lab" || key === "labroom"
+                          ? S.tabLabActive
+                          : S.tabActive
+                        : {}),
+                    }}>
+                    {label}
+                    {key === "labroom" && Object.keys(labRoomTTs).length > 0 && (
+                      <span style={{ marginLeft: 6, fontSize: 10, background: "rgba(255,255,255,0.3)", borderRadius: 8, padding: "1px 6px" }}>
+                        {Object.keys(labRoomTTs).length}
+                      </span>
+                    )}
                   </button>
                 ))}
               </div>
 
+              {/* Division View */}
               {viewMode === "division" && (
                 <>
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
@@ -1733,18 +1903,11 @@ export default function GenerateTimetable() {
                   )}
                   {activeYbId && activeDiv && allTimetables[activeYbId]?.[activeDiv] && (
                     <>
-                      <TimetableTable grid={allTimetables[activeYbId][activeDiv]}
-                        caption={`${dept}  ·  ${semLabel}  ·  ${activeYbId} / Division ${activeDiv}`} />
+                      <TimetableTable grid={allTimetables[activeYbId][activeDiv]} caption={`${dept}  ·  ${semLabel}  ·  ${activeYbId} / Division ${activeDiv}`} />
                       <div style={{ marginTop: 14, display: "flex", gap: 10, flexWrap: "wrap" }}>
-                        <button className="card-btn btn-teal" style={{ fontSize: 13, padding: "8px 20px" }} onClick={() => downloadSingle(activeYbId, activeDiv)}>
-                          ⬇ Excel: {activeYbId} / Div {activeDiv}
-                        </button>
-                        <button className="card-btn btn-blue" style={{ fontSize: 13, padding: "8px 20px" }}
-                          onClick={() => generatePDF(allTimetables[activeYbId][activeDiv], `${activeYbId} / Division ${activeDiv}`, dept, semLabel, teachers, getFooterRolesForDiv(activeYbId, activeDiv))}>
-                          📄 PDF: {activeYbId} / Div {activeDiv}
-                        </button>
+                        <button className="card-btn btn-teal" style={{ fontSize: 13, padding: "8px 20px" }} onClick={() => downloadSingle(activeYbId, activeDiv)}>⬇ Excel: {activeYbId} / Div {activeDiv}</button>
+                        <button className="card-btn btn-blue" style={{ fontSize: 13, padding: "8px 20px" }} onClick={() => generatePDF(allTimetables[activeYbId][activeDiv], `${activeYbId} / Division ${activeDiv}`, dept, semLabel, teachers, getFooterRolesForDiv(activeYbId, activeDiv))}>📄 PDF: {activeYbId} / Div {activeDiv}</button>
                       </div>
-                      {/* Footer preview with per-div counsellor */}
                       {(() => {
                         const previewRoles = getFooterRolesForDiv(activeYbId, activeDiv);
                         return previewRoles.some(r => r.name) ? (
@@ -1769,6 +1932,22 @@ export default function GenerateTimetable() {
                 </>
               )}
 
+              {/* Lab Schedule (Division) View */}
+              {viewMode === "lab" && (
+                <LabViewTable allTimetables={allTimetables} yearBranches={yearBranches} />
+              )}
+
+              {/* NEW: Lab Room View */}
+              {viewMode === "labroom" && (
+                <LabRoomView
+                  labRoomTTs={labRoomTTs}
+                  teachers={teachers}
+                  dept={dept}
+                  semLabel={semLabel}
+                />
+              )}
+
+              {/* Teacher View */}
               {viewMode === "teacher" && (
                 <>
                   {!teachers.length ? <div style={S.emptyBox}>No teachers added.</div> : (
@@ -1780,8 +1959,7 @@ export default function GenerateTimetable() {
                         ))}
                       </div>
                       {activeTeacher && teacherTTs[activeTeacher] && (
-                        <TeacherTTTable teacherGrid={teacherTTs[activeTeacher]}
-                          caption={`Teacher: ${teachers.find(t => t.code === activeTeacher)?.name || activeTeacher} (${activeTeacher})`} />
+                        <TeacherTTTable teacherGrid={teacherTTs[activeTeacher]} caption={`Teacher: ${teachers.find(t => t.code === activeTeacher)?.name || activeTeacher} (${activeTeacher})`} />
                       )}
                     </>
                   )}
@@ -1829,4 +2007,6 @@ const S = {
   tabBtn: { padding: "7px 16px", fontSize: 13, borderRadius: 20, border: "1.5px solid #c8d5ea", background: "#f0f4ff", color: "#4a6fa5", cursor: "pointer", fontWeight: 500 },
   tabYBActive: { background: "linear-gradient(90deg,#667eea,#764ba2)", color: "#fff", border: "1.5px solid transparent", fontWeight: 700 },
   tabTeacherActive: { background: "linear-gradient(90deg,#2d6a4f,#40916c)", color: "#fff", border: "1.5px solid transparent", fontWeight: 700 },
+  tabLabActive: { background: "linear-gradient(90deg,#276749,#38a169)", color: "#fff", border: "1.5px solid transparent", fontWeight: 700 },
+  tabLabRoomActive: { background: "linear-gradient(90deg,#276749,#38a169)", color: "#fff", border: "1.5px solid transparent", fontWeight: 700 },
 };

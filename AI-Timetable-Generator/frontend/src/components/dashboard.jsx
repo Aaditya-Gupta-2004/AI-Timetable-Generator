@@ -219,3 +219,10 @@ const S = {
   emptyState:  {padding:"40px 20px",textAlign:"center",color:"#777"},
   linkBtn:     {background:"none",border:"none",cursor:"pointer",color:"#667eea",textDecoration:"underline",fontSize:13,padding:0},
 };
+
+
+
+
+
+
+// 3) in preview and dashboard why i am not getting all last time generated timetables of each view teachers view labs view  and student view also i want that when user want to  deleted any timetable or timetables already generated they able to delete that also show them date of generation so they can take decision
