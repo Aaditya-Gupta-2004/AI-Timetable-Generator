@@ -3,8 +3,26 @@ import ReactDOM from "react-dom";
 import { useNavigate } from "react-router-dom";
 import Layout from "./Layout";
 import * as XLSX from "xlsx";
+import PersonalTimetableTab from "./PersonalTimetableTab";
 
 const API_BASE = "https://ai-timetable-generator-j7qx.onrender.com";
+
+
+const [teacherLoads, setTeacherLoads] = useState({});
+const [personalTimetables, setPersonalTimetables] = useState({});
+
+
+apiGet("/teacher-loads").then(rows => {
+  const lm = {};
+  rows.forEach(r => {
+    lm[r.teacher_code] = { maxTheory: r.max_theory, maxPractical: r.max_practical };
+  });
+  setTeacherLoads(lm);
+}).catch(() => { });
+
+apiGet("/personal-timetables").then(pts => {
+  setPersonalTimetables(pts || {});
+}).catch(() => { });
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
 const DAY_SHORT = { Monday: "Mon", Tuesday: "Tue", Wednesday: "Wed", Thursday: "Thu", Friday: "Fri" };
@@ -1033,7 +1051,7 @@ export default function GenerateTimetable() {
               if (subObj) newAssignments[yb.id][div][subObj.id] = { teacherCode: assignVal.teacher_code || "" };
             });
           });
-        } catch {}
+        } catch { }
       }
       setAssignments(newAssignments);
       setDivCounsellors(newCounsellors);
@@ -1197,7 +1215,7 @@ export default function GenerateTimetable() {
 
     if (yearBranches.length) { setActiveYbId(yearBranches[0].id); setActiveDiv(yearBranches[0].divs[0]); }
     if (teachers.length) setActiveTeacher(teachers[0].code);
-    setGenerated(true); setActiveTab(5);
+    setGenerated(true); setActiveTab(6);
 
     try {
       await apiPost("/teachers/bulk", teachers.map(t => ({ code: t.code, name: t.name })));
@@ -1360,7 +1378,7 @@ export default function GenerateTimetable() {
   };
 
   // ── Render helpers ────────────────────────────────────────────────────────
-  const TABS = ["① Setup", "② Subjects", "③ Rooms", "④ Teachers", "⑤ Details", "⑥ Generate"];
+  const TABS = ["① Setup", "② Subjects", "③ Rooms", "④ Teachers", "⑤ Personal TT", "⑤ Details", "⑥ Generate"];
   const currentYB = yearBranches.find(yb => yb.id === activeYbId);
   const classroomPool = rooms.filter(r => r.type === "classroom");
   const labPool = rooms.filter(r => r.type === "lab");
@@ -1768,8 +1786,19 @@ export default function GenerateTimetable() {
         </>
       )}
 
-      {/* ════ TAB 4 — DETAILS ═══════════════════════════════════════════════ */}
       {activeTab === 4 && (
+        <PersonalTimetableTab
+          teachers={teachers}
+          yearBranches={yearBranches}
+          personalTimetables={personalTimetables}
+          setPersonalTimetables={setPersonalTimetables}
+          activeTab={activeTab}
+          setActiveTab={setActiveTab}
+        />
+      )}
+
+      {/* ════ TAB 4 — DETAILS ═══════════════════════════════════════════════ */}
+      {activeTab === 5 && (
         <>
           {yearBranches.length > 0 && (
             <div className="panel" style={{ marginBottom: 20 }}>
@@ -1830,7 +1859,7 @@ export default function GenerateTimetable() {
       )}
 
       {/* ════ TAB 5 — GENERATE & VIEW ══════════════════════════════════════ */}
-      {activeTab === 5 && (
+      {activeTab === 6 && (
         <>
           {rooms.length > 0 && (
             <div style={{ marginBottom: 16, padding: "10px 14px", background: "#f8f9fb", borderRadius: 8, border: "1px dashed #d5dae3", fontSize: 12, color: "#555" }}>

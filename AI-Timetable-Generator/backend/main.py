@@ -152,7 +152,7 @@ class AssignmentDB(Base):
     batch_assigns_json = Column(Text,    nullable=True)
 
 
-# ── NEW: Rooms table ──────────────────────────────────────────────────────────
+# ── Rooms table ───────────────────────────────────────────────────────────────
 class RoomDB(Base):
     __tablename__ = "rooms"
     id      = Column(Integer, primary_key=True)
@@ -160,6 +160,30 @@ class RoomDB(Base):
     number  = Column(String, nullable=False)
     type    = Column(String, nullable=False)   # "classroom" | "lab"
     __table_args__ = (UniqueConstraint("user_id", "number", name="uq_user_room"),)
+
+
+# ── NEW: Teacher Load table ───────────────────────────────────────────────────
+class TeacherLoadDB(Base):
+    """Max theory + practical sessions per teacher per week."""
+    __tablename__ = "teacher_loads"
+    id            = Column(Integer, primary_key=True)
+    user_id       = Column(Integer, ForeignKey("users.id"), nullable=False)
+    teacher_code  = Column(String, nullable=False)
+    max_theory    = Column(Integer, nullable=True)    # None = no limit
+    max_practical = Column(Integer, nullable=True)    # None = no limit
+    __table_args__ = (UniqueConstraint("user_id", "teacher_code", name="uq_user_tload"),)
+
+
+# ── NEW: Personal Timetable table ─────────────────────────────────────────────
+class PersonalTimetableDB(Base):
+    """A teacher's self-declared fixed/pinned slots."""
+    __tablename__ = "personal_timetables"
+    id            = Column(Integer, primary_key=True)
+    user_id       = Column(Integer, ForeignKey("users.id"), nullable=False)
+    teacher_code  = Column(String, nullable=False)
+    # JSON shape: { "Monday": { "9-10": { "subject":"OS", "room":"304", "yb_key":"SE-IT", "div":"A" } } }
+    slots_json    = Column(Text, nullable=False, default="{}")
+    __table_args__ = (UniqueConstraint("user_id", "teacher_code", name="uq_user_ptt"),)
 
 
 Base.metadata.create_all(bind=engine)
@@ -213,6 +237,27 @@ def run_migrations():
             conn.execute(sa.text(
                 "CREATE TABLE rooms (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL "
                 "REFERENCES users(id), number TEXT NOT NULL, type TEXT NOT NULL)"
+            ))
+
+        # ── NEW: teacher_loads table ──────────────────────────────────────────
+        if "teacher_loads" not in tables:
+            conn.execute(sa.text(
+                "CREATE TABLE teacher_loads ("
+                "id INTEGER PRIMARY KEY, "
+                "user_id INTEGER NOT NULL REFERENCES users(id), "
+                "teacher_code TEXT NOT NULL, "
+                "max_theory INTEGER, "
+                "max_practical INTEGER)"
+            ))
+
+        # ── NEW: personal_timetables table ───────────────────────────────────
+        if "personal_timetables" not in tables:
+            conn.execute(sa.text(
+                "CREATE TABLE personal_timetables ("
+                "id INTEGER PRIMARY KEY, "
+                "user_id INTEGER NOT NULL REFERENCES users(id), "
+                "teacher_code TEXT NOT NULL, "
+                "slots_json TEXT NOT NULL DEFAULT '{}')"
             ))
 
         conn.commit()
@@ -298,10 +343,21 @@ class ProfileUpdate(BaseModel):
     new_username:  Optional[str] = None
     new_password:  Optional[str] = None
 
-# New: save subjects independently (with yb_key)
+# Save subjects independently (with yb_key)
 class SaveSubjectsInput(BaseModel):
     yb_key:   str
     subjects: List[Subject]
+
+# ── NEW: Pydantic models for load management & personal timetable ─────────────
+class TeacherLoadModel(BaseModel):
+    teacher_code:  str
+    max_theory:    Optional[int] = None
+    max_practical: Optional[int] = None
+
+class PersonalTimetableInput(BaseModel):
+    teacher_code: str
+    # { day: { slot: { subject, room, yb_key, div } } }
+    slots: Dict[str, Dict[str, Any]]
 
 
 # =========================
@@ -404,7 +460,7 @@ def delete_teacher(code: str, username: str = Depends(verify_token), db: Session
 
 
 # =========================
-# ROOMS ROUTES  ← NEW
+# ROOMS ROUTES
 # =========================
 
 @router.get("/rooms")
@@ -442,6 +498,102 @@ def delete_room(number: str, username: str = Depends(verify_token), db: Session 
     db.query(RoomDB).filter(RoomDB.user_id == uid, RoomDB.number == number).delete()
     db.commit()
     return {"message": "Room deleted"}
+
+
+# =========================
+# NEW: TEACHER LOAD ROUTES
+# =========================
+
+@router.get("/teacher-loads")
+def get_teacher_loads(
+    username: str    = Depends(verify_token),
+    db:       Session = Depends(get_db),
+):
+    uid  = get_user_id(username, db)
+    rows = db.query(TeacherLoadDB).filter(TeacherLoadDB.user_id == uid).all()
+    return [
+        {
+            "teacher_code":  r.teacher_code,
+            "max_theory":    r.max_theory,
+            "max_practical": r.max_practical,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/teacher-loads/bulk")
+def save_teacher_loads_bulk(
+    loads:    List[TeacherLoadModel],
+    username: str     = Depends(verify_token),
+    db:       Session = Depends(get_db),
+):
+    uid = get_user_id(username, db)
+    db.query(TeacherLoadDB).filter(TeacherLoadDB.user_id == uid).delete()
+    for l in loads:
+        # Only persist rows that actually have a limit set
+        if l.max_theory is not None or l.max_practical is not None:
+            db.add(TeacherLoadDB(
+                user_id       = uid,
+                teacher_code  = l.teacher_code.strip().upper(),
+                max_theory    = l.max_theory,
+                max_practical = l.max_practical,
+            ))
+    db.commit()
+    return {"message": f"Saved {len(loads)} teacher load records"}
+
+
+# =========================
+# NEW: PERSONAL TIMETABLE ROUTES
+# =========================
+
+@router.get("/personal-timetables")
+def get_all_personal_timetables(
+    username: str     = Depends(verify_token),
+    db:       Session = Depends(get_db),
+):
+    """Return every teacher's pinned slots for the logged-in user."""
+    uid  = get_user_id(username, db)
+    rows = db.query(PersonalTimetableDB).filter(PersonalTimetableDB.user_id == uid).all()
+    return {r.teacher_code: json.loads(r.slots_json) for r in rows}
+
+
+@router.post("/personal-timetable")
+def save_personal_timetable(
+    data:     PersonalTimetableInput,
+    username: str     = Depends(verify_token),
+    db:       Session = Depends(get_db),
+):
+    uid  = get_user_id(username, db)
+    code = data.teacher_code.strip().upper()
+    row  = db.query(PersonalTimetableDB).filter(
+        PersonalTimetableDB.user_id      == uid,
+        PersonalTimetableDB.teacher_code == code,
+    ).first()
+    if row:
+        row.slots_json = json.dumps(data.slots)
+    else:
+        db.add(PersonalTimetableDB(
+            user_id      = uid,
+            teacher_code = code,
+            slots_json   = json.dumps(data.slots),
+        ))
+    db.commit()
+    return {"message": "Personal timetable saved"}
+
+
+@router.delete("/personal-timetable/{teacher_code}")
+def delete_personal_timetable(
+    teacher_code: str,
+    username: str     = Depends(verify_token),
+    db:       Session = Depends(get_db),
+):
+    uid = get_user_id(username, db)
+    db.query(PersonalTimetableDB).filter(
+        PersonalTimetableDB.user_id      == uid,
+        PersonalTimetableDB.teacher_code == teacher_code.upper(),
+    ).delete()
+    db.commit()
+    return {"message": "Deleted"}
 
 
 # =========================
@@ -840,19 +992,10 @@ def check_teacher_conflicts(all_timetables: dict) -> list:
 # =========================
 
 def _normalise_cell(cell: dict) -> dict:
-    """
-    The React frontend stores cells with camelCase keys:
-      teacherCode, batches[].teacherCode
-    The backend / DB expects snake_case:
-      teacher_code, batches[].teacher_code
-    This function converts in-place and returns the dict.
-    """
     if not cell or not isinstance(cell, dict):
         return cell
-    # top-level key rename
     if "teacherCode" in cell and "teacher_code" not in cell:
         cell["teacher_code"] = cell.pop("teacherCode")
-    # batches list
     if cell.get("batches"):
         for b in cell["batches"]:
             if "teacherCode" in b and "teacher_code" not in b:
@@ -861,7 +1004,6 @@ def _normalise_cell(cell: dict) -> dict:
 
 
 def normalise_timetable(timetable: dict) -> dict:
-    """Walk every cell in a div-grid and normalise keys."""
     for day in DAYS:
         for slot in SLOTS:
             if day in timetable and slot in timetable[day]:
@@ -930,7 +1072,6 @@ def generate_timetable(
     subjects_dicts = [s.model_dump() for s in data.subjects]
 
     if data.timetables:
-        # Normalise frontend camelCase keys before storing
         timetables = {
             div: normalise_timetable(grid)
             for div, grid in data.timetables.items()
@@ -1123,29 +1264,28 @@ app.include_router(router)
 
 from fastapi import Header
 
-# THIS IS YOUR MASTER KEY. 
+# THIS IS YOUR MASTER KEY.
 # You must type this EXACTLY into the HTML input box.
-ADMIN_SECRET_TOKEN = "backend_dev_2026_access" 
+ADMIN_SECRET_TOKEN = "backend_dev_2026_access"
 
 @router.get("/admin", response_class=HTMLResponse)
 def admin_panel(request: Request):
-    # In FastAPI, you MUST pass the 'request' object to the template
     return templates.TemplateResponse("admin.html", {"request": request, "title": "Admin Panel"})
 
 @router.get("/admin/db-explorer")
 def admin_db_explorer(x_admin_token: str = Header(None), db: Session = Depends(get_db)):
     if x_admin_token != ADMIN_SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid Admin Token")
-    
+
     timetables = db.query(TimetableDB).all()
     users = db.query(UserDB).all()
-    
+
     return {
         "timetables": [
             {
-                "id": t.id, 
-                "yb_key": t.yb_key, 
-                "user_id": t.user_id, 
+                "id": t.id,
+                "yb_key": t.yb_key,
+                "user_id": t.user_id,
                 "data": json.loads(t.data_json)
             } for t in timetables
         ],
@@ -1156,7 +1296,7 @@ def admin_db_explorer(x_admin_token: str = Header(None), db: Session = Depends(g
 def admin_delete_timetable(tt_id: int, x_admin_token: str = Header(None), db: Session = Depends(get_db)):
     if x_admin_token != ADMIN_SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
-    
+
     record = db.query(TimetableDB).filter(TimetableDB.id == tt_id).first()
     if record:
         db.delete(record)
