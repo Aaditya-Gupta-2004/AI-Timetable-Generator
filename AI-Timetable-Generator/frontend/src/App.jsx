@@ -564,7 +564,7 @@ export default function App() {
             <span style={{fontSize:12,color:C.teal,fontWeight:500,fontFamily:"'DM Sans',sans-serif"}}>Powered by AI Scheduling Engine</span>
           </div>
           <h1 style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:"clamp(36px,6vw,68px)",lineHeight:1.08,color:"#fff",marginBottom:20,animation:"fadeUp .8s cubic-bezier(.16,1,.3,1) .2s both"}}>
-            AI Timetable<br/>
+            AI Powered Timetable<br/>
             <span style={{backgroundImage:`linear-gradient(90deg,${C.pink},${C.teal})`,WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",backgroundClip:"text"}}>Generator</span>
           </h1>
           <p style={{fontSize:"clamp(15px,2vw,17px)",color:"rgba(255,255,255,.6)",lineHeight:1.7,maxWidth:420,marginBottom:36,fontFamily:"'DM Sans',sans-serif",fontWeight:300,animation:"fadeUp .8s .35s both"}}>
