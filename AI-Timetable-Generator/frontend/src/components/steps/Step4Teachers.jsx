@@ -101,6 +101,7 @@ export default function Step4Teachers({ teachers, tCode, setTCode, tName, setTNa
         {!yearBranches.length && <div style={S.emptyBox}>Add Year-Branch-Divisions in Step ① first.</div>}
       </div>
 
+      {/* Back → Step3Rooms (tab 2) | Next → LoadManagementTab (tab 4) */}
       <div style={{ display: "flex", justifyContent: "space-between" }}>
         <button className="card-btn btn-ghost" onClick={() => setActiveTab(2)}>← Back</button>
         <button className="card-btn btn-blue" style={{ padding: "10px 28px" }} onClick={() => setActiveTab(4)}>Next: Load →</button>

@@ -16,12 +16,11 @@ import Step1Setup        from "./steps/Step1Setup";
 import Step2Subjects     from "./steps/Step2Subjects";
 import Step3Rooms        from "./steps/Step3Rooms";
 import Step4Teachers     from "./steps/Step4Teachers";
-import Step5Load         from "./steps/Step5Load";
-import Step6PersonalTT   from "./steps/Step6PersonalTT";
-import Step7Details      from "./steps/Step7Details";
-import Step8Generate     from "./steps/Step8Generate";
+import LoadManagementTab from "./LoadManagementTab";   // replaces Step5Load
+import Step6Details      from "./steps/Step6Details";
+import Step7Generate     from "./steps/Step7Generate";
 
-const TABS = ["① Setup", "② Subjects", "③ Rooms", "④ Teachers", "⑤ Load", "⑥ Personal TT", "⑦ Details", "⑧ Generate"];
+const TABS = ["① Setup", "② Subjects", "③ Rooms", "④ Teachers", "⑤ Load", "⑥ Details", "⑦ Generate"];
 
 // ─────────────────────────────────────────────────────────────────────────────
 export default function GenerateTimetable() {
@@ -68,9 +67,6 @@ export default function GenerateTimetable() {
   // ── Load Management ───────────────────────────────────────────────────────
   const [teacherLoads, setTeacherLoads] = useState({});
 
-  // ── Personal Timetables ───────────────────────────────────────────────────
-  const [personalTimetables, setPersonalTimetables] = useState({});
-
   // ── Details ───────────────────────────────────────────────────────────────
   const [divCounsellors, setDivCounsellors] = useState({});
   const [footerRoles,    setFooterRoles]    = useState([
@@ -91,10 +87,32 @@ export default function GenerateTimetable() {
   const [activeTab,     setActiveTab]     = useState(0);
 
   // ── Effects ───────────────────────────────────────────────────────────────
+
+  // Reset lab fields when switching away from core lab type
   useEffect(() => {
     if (!isCoreLab(subType)) { setSubLabHours("2"); setSubWeeklyLabs("1"); }
   }, [subType]);
 
+  // FIX 1a — Load ybBatchCount from localStorage on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("ybBatchCount");
+      if (saved) setYbBatchCount(JSON.parse(saved));
+    } catch {}
+  }, []);
+
+  // FIX 1b — Persist ybBatchCount to localStorage whenever it changes
+  useEffect(() => {
+    if (Object.keys(ybBatchCount).length > 0)
+      localStorage.setItem("ybBatchCount", JSON.stringify(ybBatchCount));
+  }, [ybBatchCount]);
+
+  // FIX 2b — Persist activeSubYbId to localStorage whenever it changes
+  useEffect(() => {
+    if (activeSubYbId) localStorage.setItem("lastActiveSubYbId", activeSubYbId);
+  }, [activeSubYbId]);
+
+  // Main data load on mount — teachers, rooms, year-branches, subjects, assignments
   useEffect(() => {
     const token = localStorage.getItem("token");
     if (!token) return;
@@ -103,20 +121,22 @@ export default function GenerateTimetable() {
       apiGet("/rooms").catch(() => []),
       apiGet("/year-branches").catch(() => []),
       apiGet("/teacher-loads").catch(() => []),
-      apiGet("/personal-timetables").catch(() => ({})),
-    ]).then(async ([teacherData, roomData, ybData, loadsData, ptsData]) => {
+    ]).then(async ([teacherData, roomData, ybData, loadsData]) => {
       if (teacherData.length) setTeachers(teacherData.map(t => ({ id: uid(), code: t.code, name: t.name })));
       if (roomData.length)    setRooms(roomData.map(rm => ({ id: uid(), number: rm.number, type: rm.type })));
 
       const lm = {};
       (loadsData || []).forEach(r => { lm[r.teacher_code] = { maxTheory: r.max_theory, maxPractical: r.max_practical }; });
       setTeacherLoads(lm);
-      setPersonalTimetables(ptsData || {});
 
       if (!ybData.length) return;
       const loadedYBs = ybData.map(yb => ({ id: `${yb.year}-${yb.branch}`, year: yb.year, branch: yb.branch, divs: yb.divs }));
       setYearBranches(loadedYBs);
-      setActiveSubYbId(loadedYBs[0].id);
+
+      // FIX 2a — Restore last active selection instead of always picking index 0
+      const lastActive = localStorage.getItem("lastActiveSubYbId");
+      const validLast  = loadedYBs.find(yb => yb.id === lastActive);
+      setActiveSubYbId(validLast ? lastActive : loadedYBs[0].id);
 
       const subMap = {};
       for (const yb of loadedYBs) {
@@ -193,6 +213,7 @@ export default function GenerateTimetable() {
     if (yearBranches.find(yb => yb.id === id)) { setYbError(`${id} already added.`); return; }
     try { await apiPost("/year-branches/bulk", [{ year, branch, divs }]); } catch (e) { setYbError(`Save failed: ${e.message}`); return; }
     setYearBranches(p => [...p, { id, year, branch, divs }]);
+    // FIX 1 — ybBatchCount update triggers the localStorage-persist useEffect automatically
     setYbBatchCount(p => ({ ...p, [id]: numBatches }));
     const na = {}; divs.forEach(d => { na[d] = {}; });
     setAssignments(p => ({ ...p, [id]: na }));
@@ -200,13 +221,23 @@ export default function GenerateTimetable() {
     setBranchInput(""); setDivInput(""); setBatchInput("3");
   };
 
-  const removeYB = id => {
-    setYearBranches(p => p.filter(yb => yb.id !== id));
-    setAssignments(p => { const n = { ...p }; delete n[id]; return n; });
-    setYbSubjects(p => { const n = { ...p }; delete n[id]; return n; });
-    setYbBatchCount(p => { const n = { ...p }; delete n[id]; return n; });
+  // FIX 3 — removeYB now deletes from the backend via bulk save of remaining items
+  const removeYB = async id => {
+    const updated = yearBranches.filter(yb => yb.id !== id);
+    try {
+      await apiPost("/year-branches/bulk", updated.map(yb => ({
+        year: yb.year, branch: yb.branch, divs: yb.divs,
+      })));
+    } catch (e) {
+      setApiError(`Remove year-branch failed: ${e.message}`);
+      return;
+    }
+    setYearBranches(updated);
+    setAssignments(p    => { const n = { ...p }; delete n[id]; return n; });
+    setYbSubjects(p     => { const n = { ...p }; delete n[id]; return n; });
+    setYbBatchCount(p   => { const n = { ...p }; delete n[id]; return n; });
     setDivCounsellors(p => { const n = { ...p }; delete n[id]; return n; });
-    setActiveSubYbId(p => p === id ? "" : p);
+    setActiveSubYbId(p  => p === id ? (updated[0]?.id || "") : p);
   };
 
   const addSubject = async (subNameRef) => {
@@ -306,7 +337,7 @@ export default function GenerateTimetable() {
     setTeacherTTs(buildTeacherTTs(newAllTT, teachers));
     setLabRoomTTs(buildLabRoomTTs(newAllTT));
     setGenerated(true);
-    setActiveTab(7);
+    setActiveTab(6);
 
     try {
       await apiPost("/teachers/bulk", teachers.map(t => ({ code: t.code, name: t.name })));
@@ -463,23 +494,108 @@ export default function GenerateTimetable() {
         ))}
       </div>
 
-      {activeTab === 0 && <Step1Setup dept={dept} setDept={setDept} semLabel={semLabel} setSemLabel={setSemLabel} yearInput={yearInput} setYearInput={setYearInput} branchInput={branchInput} setBranchInput={setBranchInput} divInput={divInput} setDivInput={setDivInput} batchInput={batchInput} setBatchInput={setBatchInput} ybError={ybError} setYbError={setYbError} yearBranches={yearBranches} ybBatchCount={ybBatchCount} addYearBranch={addYearBranch} removeYB={removeYB} setActiveTab={setActiveTab} />}
+      {/* ════ TAB 0 — SETUP ════════════════════════════════════════════════ */}
+      {activeTab === 0 && (
+        <Step1Setup
+          dept={dept} setDept={setDept}
+          semLabel={semLabel} setSemLabel={setSemLabel}
+          yearInput={yearInput} setYearInput={setYearInput}
+          branchInput={branchInput} setBranchInput={setBranchInput}
+          divInput={divInput} setDivInput={setDivInput}
+          batchInput={batchInput} setBatchInput={setBatchInput}
+          ybError={ybError} setYbError={setYbError}
+          yearBranches={yearBranches} ybBatchCount={ybBatchCount}
+          addYearBranch={addYearBranch} removeYB={removeYB}
+          setActiveTab={setActiveTab}
+        />
+      )}
 
-      {activeTab === 1 && <Step2Subjects yearBranches={yearBranches} ybSubjects={ybSubjects} activeSubYbId={activeSubYbId} setActiveSubYbId={setActiveSubYbId} subName={subName} setSubName={setSubName} subType={subType} setSubType={setSubType} subHours={subHours} setSubHours={setSubHours} subLabHours={subLabHours} setSubLabHours={setSubLabHours} subWeeklyLabs={subWeeklyLabs} setSubWeeklyLabs={setSubWeeklyLabs} subError={subError} setSubError={setSubError} addSubject={addSubject} removeSubject={removeSubject} ybBatchCount={ybBatchCount} setActiveTab={setActiveTab} />}
+      {/* ════ TAB 1 — SUBJECTS ═════════════════════════════════════════════ */}
+      {activeTab === 1 && (
+        <Step2Subjects
+          yearBranches={yearBranches} ybSubjects={ybSubjects}
+          activeSubYbId={activeSubYbId} setActiveSubYbId={setActiveSubYbId}
+          subName={subName} setSubName={setSubName}
+          subType={subType} setSubType={setSubType}
+          subHours={subHours} setSubHours={setSubHours}
+          subLabHours={subLabHours} setSubLabHours={setSubLabHours}
+          subWeeklyLabs={subWeeklyLabs} setSubWeeklyLabs={setSubWeeklyLabs}
+          subError={subError} setSubError={setSubError}
+          addSubject={addSubject} removeSubject={removeSubject}
+          ybBatchCount={ybBatchCount}
+          setActiveTab={setActiveTab}
+        />
+      )}
 
-      {activeTab === 2 && <Step3Rooms rooms={rooms} roomNum={roomNum} setRoomNum={setRoomNum} roomType={roomType} setRoomType={setRoomType} roomError={roomError} setRoomError={setRoomError} addRoom={addRoom} removeRoom={removeRoom} yearBranches={yearBranches} roomAssignMode={roomAssignMode} setRoomAssignMode={setRoomAssignMode} ybRoomConfig={ybRoomConfig} toggleRoomInPool={toggleRoomInPool} setActiveTab={setActiveTab} />}
+      {/* ════ TAB 2 — ROOMS ════════════════════════════════════════════════ */}
+      {activeTab === 2 && (
+        <Step3Rooms
+          rooms={rooms} roomNum={roomNum} setRoomNum={setRoomNum}
+          roomType={roomType} setRoomType={setRoomType}
+          roomError={roomError} setRoomError={setRoomError}
+          addRoom={addRoom} removeRoom={removeRoom}
+          yearBranches={yearBranches}
+          roomAssignMode={roomAssignMode} setRoomAssignMode={setRoomAssignMode}
+          ybRoomConfig={ybRoomConfig} toggleRoomInPool={toggleRoomInPool}
+          setActiveTab={setActiveTab}
+        />
+      )}
 
-      {activeTab === 3 && <Step4Teachers teachers={teachers} tCode={tCode} setTCode={setTCode} tName={tName} setTName={setTName} tError={tError} setTError={setTError} addTeacher={addTeacher} removeTeacher={removeTeacher} yearBranches={yearBranches} ybSubjects={ybSubjects} ybBatchCount={ybBatchCount} assignments={assignments} setSubjectTeacher={setSubjectTeacher} setActiveTab={setActiveTab} />}
+      {/* ════ TAB 3 — TEACHERS ═════════════════════════════════════════════ */}
+      {activeTab === 3 && (
+        <Step4Teachers
+          teachers={teachers}
+          tCode={tCode} setTCode={setTCode}
+          tName={tName} setTName={setTName}
+          tError={tError} setTError={setTError}
+          addTeacher={addTeacher} removeTeacher={removeTeacher}
+          yearBranches={yearBranches} ybSubjects={ybSubjects}
+          ybBatchCount={ybBatchCount} assignments={assignments}
+          setSubjectTeacher={setSubjectTeacher}
+          setActiveTab={setActiveTab}
+        />
+      )}
 
-      {activeTab === 4 && <Step5Load teachers={teachers} teacherLoads={teacherLoads} setTeacherLoads={setTeacherLoads} setActiveTab={setActiveTab} />}
+      {/* ════ TAB 4 — LOAD MANAGEMENT ══════════════════════════════════════ */}
+      {activeTab === 4 && (
+        <LoadManagementTab
+          teachers={teachers}
+          teacherLoads={teacherLoads}
+          setTeacherLoads={setTeacherLoads}
+          activeTab={activeTab}
+          setActiveTab={setActiveTab}
+        />
+      )}
 
-      {activeTab === 5 && <Step6PersonalTT teachers={teachers} yearBranches={yearBranches} personalTimetables={personalTimetables} setPersonalTimetables={setPersonalTimetables} activeTab={activeTab} setActiveTab={setActiveTab} />}
+      {/* ════ TAB 5 — DETAILS ══════════════════════════════════════════════ */}
+      {activeTab === 5 && (
+        <Step6Details
+          yearBranches={yearBranches} teachers={teachers}
+          divCounsellors={divCounsellors} setDivCounsellor={setDivCounsellor}
+          footerRoles={footerRoles} setFooterRoles={setFooterRoles}
+          cfRole={cfRole} setCfRole={setCfRole}
+          cfName={cfName} setCfName={setCfName}
+          setActiveTab={setActiveTab}
+        />
+      )}
 
-      {activeTab === 6 && <Step7Details yearBranches={yearBranches} teachers={teachers} divCounsellors={divCounsellors} setDivCounsellor={setDivCounsellor} footerRoles={footerRoles} setFooterRoles={setFooterRoles} cfRole={cfRole} setCfRole={setCfRole} cfName={cfName} setCfName={setCfName} setActiveTab={setActiveTab} />}
+      {/* ════ TAB 6 — GENERATE ═════════════════════════════════════════════ */}
+      {activeTab === 6 && (
+        <Step7Generate
+          dept={dept} semLabel={semLabel}
+          rooms={rooms} yearBranches={yearBranches} teachers={teachers}
+          allTimetables={allTimetables} teacherTTs={teacherTTs} labRoomTTs={labRoomTTs}
+          generated={generated} generating={generating}
+          handleGenerate={handleGenerate}
+          downloadAll={downloadAll} downloadSingle={downloadSingle}
+          getFooterRolesForDiv={getFooterRolesForDiv}
+          setActiveTab={setActiveTab}
+        />
+      )}
 
-      {activeTab === 7 && <Step8Generate dept={dept} semLabel={semLabel} rooms={rooms} yearBranches={yearBranches} teachers={teachers} allTimetables={allTimetables} teacherTTs={teacherTTs} labRoomTTs={labRoomTTs} generated={generated} generating={generating} handleGenerate={handleGenerate} downloadAll={downloadAll} downloadSingle={downloadSingle} getFooterRolesForDiv={getFooterRolesForDiv} setActiveTab={setActiveTab} />}
-
-      <button className="generate-fab" disabled={generating} onClick={handleGenerate}>{generating ? "⏳" : "⚡"}</button>
+      <button className="generate-fab" disabled={generating} onClick={handleGenerate}>
+        {generating ? "⏳" : "⚡"}
+      </button>
     </Layout>
   );
 }
