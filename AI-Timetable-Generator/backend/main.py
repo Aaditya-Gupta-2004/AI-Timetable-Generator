@@ -134,6 +134,14 @@ class TimetableDB(Base):
     __table_args__ = (UniqueConstraint("user_id", "yb_key", name="uq_user_yb"),)
 
 
+class TimetableRunDB(Base):
+    __tablename__ = "timetable_runs"
+    id         = Column(Integer, primary_key=True)
+    user_id    = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(String, nullable=False)
+    data_json  = Column(Text, nullable=False)
+
+
 class AssignmentDB(Base):
     """
     Stores teacher/room assignments per subject per division.
@@ -239,6 +247,15 @@ def run_migrations():
                 "REFERENCES users(id), number TEXT NOT NULL, type TEXT NOT NULL)"
             ))
 
+        if "timetable_runs" not in tables:
+            conn.execute(sa.text(
+                "CREATE TABLE timetable_runs ("
+                "id INTEGER PRIMARY KEY, "
+                "user_id INTEGER NOT NULL REFERENCES users(id), "
+                "created_at TEXT NOT NULL, "
+                "data_json TEXT NOT NULL)"
+            ))
+
         # ── NEW: teacher_loads table ──────────────────────────────────────────
         if "teacher_loads" not in tables:
             conn.execute(sa.text(
@@ -273,8 +290,16 @@ app = FastAPI(title="AI Timetable Generator")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://localhost:3000",
+        "https://127.0.0.1:3000",
+    ],
+    allow_origin_regex=r"https://.*",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 router = APIRouter()
@@ -347,6 +372,15 @@ class ProfileUpdate(BaseModel):
 class SaveSubjectsInput(BaseModel):
     yb_key:   str
     subjects: List[Subject]
+
+
+class SaveAssignmentsInput(BaseModel):
+    yb_key: str
+    assignments: Dict[str, Dict[str, Any]]
+
+
+class SaveTimetableRunInput(BaseModel):
+    all_timetables: Dict[str, Dict[str, Any]]
 
 # ── NEW: Pydantic models for load management & personal timetable ─────────────
 class TeacherLoadModel(BaseModel):
@@ -635,6 +669,38 @@ def clear_subjects(username: str = Depends(verify_token), db: Session = Depends(
     db.query(SubjectDB).filter(SubjectDB.user_id == uid).delete()
     db.commit()
     return {"message": "Subjects cleared"}
+
+
+@router.post("/assignments/bulk")
+def save_assignments_bulk(data: SaveAssignmentsInput, username: str = Depends(verify_token), db: Session = Depends(get_db)):
+    uid = get_user_id(username, db)
+    db.query(AssignmentDB).filter(
+        AssignmentDB.user_id == uid, AssignmentDB.yb_key == data.yb_key
+    ).delete()
+
+    for div, sub_map in (data.assignments or {}).items():
+        for sub_name, assign_val in (sub_map or {}).items():
+            if isinstance(assign_val, dict):
+                t_code = assign_val.get("teacher_code", "")
+                room = assign_val.get("room", "")
+                batch_assigns = assign_val.get("batch_assigns") or None
+            else:
+                t_code = assign_val
+                room = ""
+                batch_assigns = None
+
+            db.add(AssignmentDB(
+                user_id=uid,
+                yb_key=data.yb_key,
+                division=div,
+                subject_name=sub_name,
+                teacher_code=t_code,
+                room=room,
+                batch_assigns_json=json.dumps(batch_assigns) if batch_assigns else None,
+            ))
+
+    db.commit()
+    return {"message": f"Saved assignments for {data.yb_key}"}
 
 
 # =========================
@@ -1011,6 +1077,51 @@ def normalise_timetable(timetable: dict) -> dict:
     return timetable
 
 
+def normalise_all_timetables(all_timetables: dict) -> dict:
+    normalised = {}
+    for yb_key, div_grids in (all_timetables or {}).items():
+        normalised[yb_key] = {}
+        for div, grid in (div_grids or {}).items():
+            normalised[yb_key][div] = normalise_timetable(copy.deepcopy(grid))
+    return normalised
+
+
+def summarise_all_timetables(all_timetables: dict) -> dict:
+    yb_keys = sorted((all_timetables or {}).keys())
+    division_labels = []
+    for yb_key in yb_keys:
+      for div in sorted((all_timetables.get(yb_key) or {}).keys()):
+          division_labels.append(f"{yb_key}-{div}")
+    return {
+        "yb_keys": yb_keys,
+        "division_labels": division_labels,
+        "division_count": len(division_labels),
+    }
+
+
+def upsert_current_timetables(uid: int, all_timetables: dict, db: Session):
+    for yb_key, timetables in (all_timetables or {}).items():
+        existing_tt = db.query(TimetableDB).filter(
+            TimetableDB.user_id == uid, TimetableDB.yb_key == yb_key
+        ).first()
+        if existing_tt:
+            existing_tt.data_json = json.dumps(timetables)
+        else:
+            db.add(TimetableDB(user_id=uid, yb_key=yb_key, data_json=json.dumps(timetables)))
+
+
+def rebuild_current_timetables(uid: int, db: Session):
+    db.query(TimetableDB).filter(TimetableDB.user_id == uid).delete()
+    runs = db.query(TimetableRunDB).filter(TimetableRunDB.user_id == uid).order_by(TimetableRunDB.created_at.asc()).all()
+    latest_by_yb = {}
+    for run in runs:
+        run_data = json.loads(run.data_json)
+        for yb_key, timetables in run_data.items():
+            latest_by_yb[yb_key] = timetables
+    for yb_key, timetables in latest_by_yb.items():
+        db.add(TimetableDB(user_id=uid, yb_key=yb_key, data_json=json.dumps(timetables)))
+
+
 # =========================
 # GENERATE ENDPOINT
 # =========================
@@ -1134,6 +1245,73 @@ def get_all_timetables(username: str = Depends(verify_token), db: Session = Depe
     uid     = get_user_id(username, db)
     records = db.query(TimetableDB).filter(TimetableDB.user_id == uid).all()
     return {r.yb_key: json.loads(r.data_json) for r in records}
+
+
+@router.get("/timetable-runs")
+def get_timetable_runs(username: str = Depends(verify_token), db: Session = Depends(get_db)):
+    uid = get_user_id(username, db)
+    runs = db.query(TimetableRunDB).filter(TimetableRunDB.user_id == uid).order_by(TimetableRunDB.created_at.desc()).all()
+    return [
+        {
+            "id": run.id,
+            "created_at": run.created_at,
+            **summarise_all_timetables(json.loads(run.data_json)),
+        }
+        for run in runs
+    ]
+
+
+@router.get("/timetable-runs/{run_id}")
+def get_timetable_run(run_id: int, username: str = Depends(verify_token), db: Session = Depends(get_db)):
+    uid = get_user_id(username, db)
+    run = db.query(TimetableRunDB).filter(TimetableRunDB.user_id == uid, TimetableRunDB.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Timetable run not found")
+    all_timetables = json.loads(run.data_json)
+    return {
+        "id": run.id,
+        "created_at": run.created_at,
+        "all_timetables": all_timetables,
+        "summary": summarise_all_timetables(all_timetables),
+    }
+
+
+@router.post("/timetable-runs")
+def save_timetable_run(data: SaveTimetableRunInput, username: str = Depends(verify_token), db: Session = Depends(get_db)):
+    uid = get_user_id(username, db)
+    all_timetables = normalise_all_timetables(data.all_timetables)
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    run = TimetableRunDB(
+        user_id=uid,
+        created_at=created_at,
+        data_json=json.dumps(all_timetables),
+    )
+    db.add(run)
+    upsert_current_timetables(uid, all_timetables, db)
+    db.commit()
+    db.refresh(run)
+
+    return {
+        "id": run.id,
+        "created_at": created_at,
+        "summary": summarise_all_timetables(all_timetables),
+    }
+
+
+@router.delete("/timetable-runs/{run_id}")
+def delete_timetable_run(run_id: int, username: str = Depends(verify_token), db: Session = Depends(get_db)):
+    uid = get_user_id(username, db)
+    run = db.query(TimetableRunDB).filter(TimetableRunDB.user_id == uid, TimetableRunDB.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Timetable run not found")
+
+    db.delete(run)
+    db.commit()
+    rebuild_current_timetables(uid, db)
+    db.commit()
+
+    return {"message": "Timetable run deleted"}
 
 
 @router.get("/teacher-timetable/{teacher_code}")

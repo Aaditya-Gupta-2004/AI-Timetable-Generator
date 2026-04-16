@@ -1,8 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import Layout from "./Layout";
-
-const API_BASE = "https://ai-timetable-generator-j7qx.onrender.com";
+import { API_BASE } from "../config/api";
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
 const SLOTS = ["9-10", "10-11", "11-12", "12-1", "1-2", "2-3", "3-4", "4-5"];
 const BREAK_SLOT = "1-2";
@@ -188,3 +187,4 @@ const S = {
   emptyState: { padding: "60px 20px", textAlign: "center", color: "#777" },
   genBtn: { padding: "10px 28px", borderRadius: 8, background: "linear-gradient(90deg,#667eea,#764ba2)", color: "#fff", border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600 },
 };
+

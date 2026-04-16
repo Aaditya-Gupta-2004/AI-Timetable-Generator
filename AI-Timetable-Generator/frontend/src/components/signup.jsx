@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import * as THREE from "three";
-
-const API_BASE = "https://ai-timetable-generator-j7qx.onrender.com";
+import { API_BASE } from "../config/api";
+import BrandLogo from "./BrandLogo";
 
 function ThreeBackground() {
   const mountRef = useRef(null);
@@ -229,11 +229,29 @@ export default function Signup() {
     }}>
       {/* Three.js animated background */}
       <ThreeBackground />
+      <div
+        style={{
+          position: "absolute",
+          top: "28px",
+          left: "32px",
+          zIndex: 20,
+          display: "flex",
+          alignItems: "center",
+        }}
+      >
+        <BrandLogo
+          background="dark"
+          alt="Dr. D. Y. Patil Deemed to be University logo"
+          height={58}
+          style={{ width: "auto", maxWidth: "min(78vw, 440px)" }}
+        />
+      </div>
 
 
       {/* Glass signup card — left side */}
       <div style={{
         position: "relative", zIndex: 10,
+        marginTop: "68px",
         marginLeft: "clamp(40px, 6vw, 100px)",
         width: "clamp(300px, 90vw, 400px)",
         background: "rgba(255,255,255,0.09)",
@@ -341,5 +359,6 @@ export default function Signup() {
     </div>
   );
 }
+
 
 

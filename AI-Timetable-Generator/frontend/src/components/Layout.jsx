@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate, NavLink } from "react-router-dom";
-
-const API_BASE = "https://ai-timetable-generator-j7qx.onrender.com";
+import { API_BASE } from "../config/api";
+import BrandLogo from "./BrandLogo";
 
 const NAV_ITEMS = [
   { label: "Dashboard",          path: "/dashboard", icon: "🏠" },
@@ -72,12 +72,18 @@ const styles = `
     flex-shrink: 0;         /* never shrink — always visible */
     z-index: 100;
   }
-  .brand  { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; color: #1a2b4a; background: none; border: none; font-family: 'DM Sans', sans-serif; cursor: pointer; min-width: 130px; }
-  .brand-icon { width: 36px; height: 36px; background: #00C9A7; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: white; font-weight: 800; font-size: 13px; flex-shrink: 0; }
-  .search-wrap       { flex: 1; }
-  .search-wrap-inner { position: relative; display: inline-block; width: 100%; max-width: 420px; }
-  .search-input { width: 100%; padding: 9px 18px 9px 40px; border-radius: 50px; border: 2px solid #f0a040; font-size: 14px; font-family: 'DM Sans', sans-serif; outline: none; color: #1a2b4a; background: white; }
-  .search-icon  { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); color: #aaa; font-size: 15px; }
+  .brand  {
+    display: flex;
+    align-items: center;
+    color: #1a2b4a;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    cursor: pointer;
+    padding: 0;
+  }
+  .brand-logo { height: 68px; width: auto; max-width: 380px; }
   .nav-right    { display: flex; align-items: center; gap: 20px; margin-left: auto; }
   .nav-link-btn { font-size: 14px; color: #555; cursor: pointer; font-weight: 500; background: none; border: none; font-family: 'DM Sans', sans-serif; }
   .nav-link-btn:hover { color: #FF3B7A; }
@@ -238,16 +244,9 @@ export default function Layout({ children }) {
           {/* TOPNAV — flex-shrink:0 so it never compresses */}
           <nav className="topnav">
             <button className="brand" onClick={() => navigate("/dashboard")}>
-              <div className="brand-icon">Ai</div>
-              {!collapsed && "AI Timetable"}
+              <BrandLogo background="light" className="brand-logo" />
             </button>
 
-            <div className="search-wrap">
-              <div className="search-wrap-inner">
-                <span className="search-icon">🔍</span>
-                <input className="search-input" placeholder="Search…" />
-              </div>
-            </div>
 
             <div className="nav-right">
               <div className="avatar-wrap">

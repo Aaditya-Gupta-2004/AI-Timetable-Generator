@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import Layout from "./Layout";
+import { apiUrl } from "../config/api";
 
 export default function AdminPanel() {
   const [allData, setAllData] = useState([]);
@@ -7,7 +8,7 @@ export default function AdminPanel() {
 
   const fetchAdminData = async () => {
     const token = localStorage.getItem("token");
-    const res = await fetch("https://ai-timetable-generator-j7qx.onrender.com/admin/all-timetables", {
+    const res = await fetch(apiUrl("/admin/all-timetables"), {
       headers: { Authorization: `Bearer ${token}` }
     });
     const data = await res.json();
@@ -20,7 +21,7 @@ export default function AdminPanel() {
   const handleDelete = async (id) => {
     if (!window.confirm("Are you sure you want to delete this timetable?")) return;
     const token = localStorage.getItem("token");
-    await fetch(`http://localhost:8000/admin/timetable/${id}`, {
+    await fetch(apiUrl(`/admin/timetable/${id}`), {
       method: "DELETE",
       headers: { Authorization: `Bearer ${token}` }
     });

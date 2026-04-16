@@ -1,8 +1,20 @@
 import React from "react";
 import { S } from "../timetableHelpers";
 
-export default function Step1Setup({ dept, setDept, semLabel, setSemLabel, yearInput, setYearInput, branchInput, setBranchInput, divInput, setDivInput, batchInput, setBatchInput, ybError, setYbError, yearBranches, ybBatchCount, addYearBranch, removeYB, setActiveTab }) {
+export default function Step1Setup({
+  dept, setDept,
+  semLabel, setSemLabel,
+  yearInput, setYearInput,
+  branchInput, setBranchInput,
+  divInput, setDivInput,
+  batchInput, setBatchInput,
+  ybError, setYbError,
+  yearBranches, ybBatchCount,
+  addYearBranch, removeYB,
+  setActiveTab,
+}) {
   const getNumBatches = ybId => ybBatchCount[ybId] || 3;
+
   return (
     <>
       <div className="panel" style={{ marginBottom: 20 }}>
@@ -14,7 +26,12 @@ export default function Step1Setup({ dept, setDept, semLabel, setSemLabel, yearI
           </div>
           <div style={{ flex: 2, minWidth: 220 }}>
             <label style={S.label}>Semester Label</label>
-            <input type="text" value={semLabel} onChange={e => setSemLabel(e.target.value)} style={S.input} placeholder="e.g. EVEN Semester (IV) 2025-2026" />
+            <input
+              type="text" value={semLabel}
+              onChange={e => setSemLabel(e.target.value)}
+              style={S.input}
+              placeholder="e.g. EVEN Semester (IV) 2025-2026"
+            />
           </div>
         </div>
       </div>
@@ -34,19 +51,41 @@ export default function Step1Setup({ dept, setDept, semLabel, setSemLabel, yearI
           </div>
           <div style={{ flex: 1, minWidth: 120 }}>
             <label style={S.label}>Branch</label>
-            <input type="text" value={branchInput} onChange={e => { setBranchInput(e.target.value); setYbError(""); }} placeholder="IT, COMP…" style={S.input} />
+            <input
+              type="text" value={branchInput}
+              onChange={e => { setBranchInput(e.target.value); setYbError(""); }}
+              placeholder="IT, COMP…" style={S.input}
+            />
           </div>
           <div style={{ flex: 1, minWidth: 140 }}>
             <label style={S.label}>Divisions</label>
-            <input type="text" value={divInput} onChange={e => { setDivInput(e.target.value); setYbError(""); }} placeholder="A, B, C" style={S.input} onKeyDown={e => e.key === "Enter" && addYearBranch()} />
+            <input
+              type="text" value={divInput}
+              onChange={e => { setDivInput(e.target.value); setYbError(""); }}
+              placeholder="A, B, C" style={S.input}
+              onKeyDown={e => e.key === "Enter" && addYearBranch()}
+            />
           </div>
           <div style={{ flex: "0 0 110px" }}>
             <label style={S.label}>Batches / Div</label>
-            <input type="number" min={1} max={10} value={batchInput} onChange={e => setBatchInput(e.target.value)} style={{ ...S.input, borderColor: "#6c8ebf", background: "#f0f5ff" }} />
+            <input
+              type="number" min={1} max={10}
+              value={batchInput}
+              onChange={e => setBatchInput(e.target.value)}
+              style={{ ...S.input, borderColor: "#6c8ebf", background: "#f0f5ff" }}
+            />
           </div>
-          <button className="card-btn btn-blue" style={{ ...S.addBtn, alignSelf: "flex-end" }} onClick={addYearBranch}>+ Add</button>
+          <button
+            className="card-btn btn-blue"
+            style={{ ...S.addBtn, alignSelf: "flex-end" }}
+            onClick={addYearBranch}
+          >
+            + Add
+          </button>
         </div>
+
         {ybError && <div style={S.ferr}>{ybError}</div>}
+
         <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
           {!yearBranches.length
             ? <span style={S.empty}>No Year-Branch added yet</span>
@@ -54,15 +93,20 @@ export default function Step1Setup({ dept, setDept, semLabel, setSemLabel, yearI
               <span key={yb.id} style={{ ...S.chip, borderColor: "#667eea", color: "#667eea", background: "#f0f2ff" }}>
                 <strong>{yb.year}</strong>-{yb.branch}
                 <span style={{ fontSize: 10, color: "#999", marginLeft: 4 }}>[{yb.divs.join(",")}]</span>
-                <span style={{ fontSize: 10, marginLeft: 4, background: "#e0e7ff", borderRadius: 8, padding: "0 6px", color: "#4c51bf" }}>{getNumBatches(yb.id)} batches</span>
+                <span style={{ fontSize: 10, marginLeft: 4, background: "#e0e7ff", borderRadius: 8, padding: "0 6px", color: "#4c51bf" }}>
+                  {getNumBatches(yb.id)} batches
+                </span>
                 <button onClick={() => removeYB(yb.id)} style={S.chipX}>✕</button>
               </span>
             ))}
         </div>
       </div>
 
+      {/* Next → Subjects (tab 2) */}
       <div style={{ textAlign: "right" }}>
-        <button className="card-btn btn-blue" style={{ padding: "10px 28px" }} onClick={() => setActiveTab(1)}>Next: Subjects →</button>
+        <button className="card-btn btn-blue" style={{ padding: "10px 28px" }} onClick={() => setActiveTab(2)}>
+          Next: Subjects →
+        </button>
       </div>
     </>
   );
