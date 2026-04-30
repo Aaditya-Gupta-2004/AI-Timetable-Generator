@@ -121,6 +121,8 @@ export default function Step6Generate({
   handleGenerate,
   downloadAll,
   downloadSingle,
+  downloadAllPDF,
+  downloadSinglePDF,
   getFooterRolesForDiv,
   setActiveTab,
 }) {
@@ -164,17 +166,30 @@ export default function Step6Generate({
             {generating ? "⏳ Generating…" : "⚡ Generate Timetable"}
           </button>
           {generated && (
-            <button
-              onClick={downloadAll}
-              style={{
-                padding: "13px 28px", borderRadius: 10, border: "none",
-                background: "#00C9A7", color: "#fff", fontWeight: 700,
-                fontSize: 14, cursor: "pointer",
-                boxShadow: "0 4px 14px rgba(0,201,167,0.35)",
-              }}
-            >
-              📥 Download All (.xlsx)
-            </button>
+            <>
+              <button
+                onClick={downloadAll}
+                style={{
+                  padding: "13px 28px", borderRadius: 10, border: "none",
+                  background: "#00C9A7", color: "#fff", fontWeight: 700,
+                  fontSize: 14, cursor: "pointer",
+                  boxShadow: "0 4px 14px rgba(0,201,167,0.35)",
+                }}
+              >
+                📥 Download All (.xlsx)
+              </button>
+              <button
+                onClick={downloadAllPDF}
+                style={{
+                  padding: "13px 28px", borderRadius: 10, border: "none",
+                  background: "#f59e0b", color: "#fff", fontWeight: 700,
+                  fontSize: 14, cursor: "pointer",
+                  boxShadow: "0 4px 14px rgba(245,158,11,0.35)",
+                }}
+              >
+                📄 Download All (PDF)
+              </button>
+            </>
           )}
         </div>
         {generated && (
@@ -235,16 +250,24 @@ export default function Step6Generate({
                   ))}
                 </div>
               )}
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 8, flexWrap: "wrap" }}>
                 <div style={{ fontWeight: 700, fontSize: 14, color: "#1a2b4a" }}>
                   {activeYbId} — Division {activeDiv}
                 </div>
-                <button
-                  onClick={() => downloadSingle(activeYbId, activeDiv)}
-                  style={{ padding: "7px 18px", borderRadius: 8, border: "1.5px solid #5b8dee", background: "#f0f5ff", color: "#3451b2", fontWeight: 600, fontSize: 12, cursor: "pointer" }}
-                >
-                  📄 Download This Sheet
-                </button>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    onClick={() => downloadSingle(activeYbId, activeDiv)}
+                    style={{ padding: "7px 18px", borderRadius: 8, border: "1.5px solid #5b8dee", background: "#f0f5ff", color: "#3451b2", fontWeight: 600, fontSize: 12, cursor: "pointer" }}
+                  >
+                    📄 Excel
+                  </button>
+                  <button
+                    onClick={() => downloadSinglePDF(activeYbId, activeDiv)}
+                    style={{ padding: "7px 18px", borderRadius: 8, border: "1.5px solid #f59e0b", background: "#fffbf0", color: "#d97706", fontWeight: 600, fontSize: 12, cursor: "pointer" }}
+                  >
+                    📋 PDF
+                  </button>
+                </div>
               </div>
               <TimetableGrid grid={currentGrid} teachers={teachers} />
             </div>

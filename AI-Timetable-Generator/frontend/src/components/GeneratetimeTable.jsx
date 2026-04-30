@@ -5,9 +5,11 @@ import * as XLSX from "xlsx";
 import {
   uid, norm, isCoreLab,
   apiGet, apiPost,
-  generateTimetable, buildTeacherTTs, buildLabRoomTTs,
+  generateAllTimetables,        // ✅ FIX: use generateAllTimetables instead of generateTimetable
+  buildTeacherTTs, buildLabRoomTTs,
   DAYS, SLOTS, BREAK_SLOT, SLOT_LBL,
   S,
+  generatePDF, generateLabRoomPDF, generateClassroomPDF,
 } from "./timetableHelpers";
 
 import Step1Setup             from "./steps/Step1Setup";
@@ -28,7 +30,6 @@ import {
   setStoredRunId,
 } from "../utils/timetableRuns";
 
-// Load tab removed — 6 steps + import
 const TABS = ["⬆️ Import", "① Setup", "② Subjects", "③ Rooms", "④ Teachers", "⑤ Details", "⑥ Generate"];
 
 export default function GenerateTimetable() {
@@ -47,7 +48,7 @@ export default function GenerateTimetable() {
   const [ybBatchCount, setYbBatchCount] = useState({});
 
   // ── Subjects ──────────────────────────────────────────────────────────────
-  const [ybSubjects, setYbSubjects]       = useState({});
+  const [ybSubjects,    setYbSubjects]    = useState({});
   const [activeSubYbId, setActiveSubYbId] = useState("");
   const getYbSubs = id => ybSubjects[id] || [];
 
@@ -83,13 +84,14 @@ export default function GenerateTimetable() {
   const [labRoomTTs,    setLabRoomTTs]    = useState({});
   const [classroomTTs,  setClassroomTTs]  = useState({});
   const [savedRuns,     setSavedRuns]     = useState([]);
-  const [selectedRunId, setSelectedRunId] = useState(null);
+  const [selectedRunId,   setSelectedRunId]   = useState(null);
   const [selectedRunMeta, setSelectedRunMeta] = useState(null);
-  const [historyLoading, setHistoryLoading] = useState(false);
-  const [apiError,      setApiError]      = useState(null);
-  const [apiSuccess,    setApiSuccess]    = useState(null);
-  const [activeTab,     setActiveTab]     = useState(0);
+  const [historyLoading,  setHistoryLoading]  = useState(false);
+  const [apiError,   setApiError]   = useState(null);
+  const [apiSuccess, setApiSuccess] = useState(null);
+  const [activeTab,  setActiveTab]  = useState(0);
 
+  // ── Run helpers ───────────────────────────────────────────────────────────
   const applyRunData = (runAllTimetables, runMeta, teacherList = teachers, roomList = rooms) => {
     const derived = buildRunViews(runAllTimetables, teacherList, roomList);
     setAllTimetables(runAllTimetables || {});
@@ -108,20 +110,15 @@ export default function GenerateTimetable() {
       const runs = await fetchTimetableRuns();
       setSavedRuns(runs);
       if (!runs.length) {
-        setSelectedRunId(null);
-        setSelectedRunMeta(null);
-        setStoredRunId(null);
+        setSelectedRunId(null); setSelectedRunMeta(null); setStoredRunId(null);
         return;
       }
-
-      const targetRun = runs.find((run) => run.id === preferredRunId) ||
-        runs.find((run) => run.id === getStoredRunId()) ||
-        runs[0];
+      const targetRun = runs.find(r => r.id === preferredRunId)
+        || runs.find(r => r.id === getStoredRunId())
+        || runs[0];
       const detail = await fetchTimetableRun(targetRun.id);
       applyRunData(detail.all_timetables, {
-        id: detail.id,
-        created_at: detail.created_at,
-        ...(detail.summary || {}),
+        id: detail.id, created_at: detail.created_at, ...(detail.summary || {}),
       }, teacherList, roomList);
     } catch (err) {
       console.error("Run history load failed:", err);
@@ -131,30 +128,18 @@ export default function GenerateTimetable() {
     }
   };
 
-  const handleLoadRun = async (runId) => {
-    await loadSavedRuns(runId);
-    setActiveTab(6);
-  };
+  const handleLoadRun  = async (runId) => { await loadSavedRuns(runId); setActiveTab(6); };
 
   const handleDeleteRun = async (runId) => {
     try {
       await deleteTimetableRun(runId);
-      const remainingRuns = savedRuns.filter((run) => run.id !== runId);
+      const remainingRuns = savedRuns.filter(r => r.id !== runId);
       setSavedRuns(remainingRuns);
-
       if (!remainingRuns.length) {
-        setSelectedRunId(null);
-        setSelectedRunMeta(null);
-        setStoredRunId(null);
-        setGenerated(false);
-        setAllTimetables({});
-        setTeacherTTs({});
-        setLabRoomTTs({});
-        setClassroomTTs({});
-        setApiSuccess("✅ Timetable run deleted.");
-        return;
+        setSelectedRunId(null); setSelectedRunMeta(null); setStoredRunId(null);
+        setGenerated(false); setAllTimetables({}); setTeacherTTs({}); setLabRoomTTs({}); setClassroomTTs({});
+        setApiSuccess("✅ Timetable run deleted."); return;
       }
-
       const nextRunId = selectedRunId === runId ? remainingRuns[0].id : selectedRunId;
       await loadSavedRuns(nextRunId);
       setApiSuccess("✅ Timetable run deleted.");
@@ -164,7 +149,6 @@ export default function GenerateTimetable() {
   };
 
   // ── Effects ───────────────────────────────────────────────────────────────
-
   useEffect(() => {
     try {
       const saved = localStorage.getItem("ybBatchCount");
@@ -191,9 +175,11 @@ export default function GenerateTimetable() {
     ]).then(async ([teacherData, roomData, ybData]) => {
       if (teacherData.length) setTeachers(teacherData.map(t => ({ id: uid(), code: t.code, name: t.name })));
       if (roomData.length)    setRooms(roomData.map(rm => ({ id: uid(), number: rm.number, type: rm.type })));
-
       if (!ybData.length) return;
-      const loadedYBs = ybData.map(yb => ({ id: `${yb.year}-${yb.branch}`, year: yb.year, branch: yb.branch, divs: yb.divs }));
+
+      const loadedYBs = ybData.map(yb => ({
+        id: `${yb.year}-${yb.branch}`, year: yb.year, branch: yb.branch, divs: yb.divs,
+      }));
       setYearBranches(loadedYBs);
 
       const lastActive = localStorage.getItem("lastActiveSubYbId");
@@ -204,7 +190,10 @@ export default function GenerateTimetable() {
       for (const yb of loadedYBs) {
         try {
           const subs    = await apiGet(`/subjects/${encodeURIComponent(yb.id)}`);
-          subMap[yb.id] = subs.map(s => ({ id: uid(), name: s.name, type: s.type, hours: s.hours || 0, labHours: s.lab_hours || 2, weeklyLabs: s.weekly_labs || 1 }));
+          subMap[yb.id] = subs.map(s => ({
+            id: uid(), name: s.name, type: s.type,
+            hours: s.hours || 0, labHours: s.lab_hours || 2, weeklyLabs: s.weekly_labs || 1,
+          }));
         } catch { subMap[yb.id] = []; }
       }
       setYbSubjects(subMap);
@@ -240,41 +229,64 @@ export default function GenerateTimetable() {
 
   // ── Excel Import ──────────────────────────────────────────────────────────
   const handleExcelImport = (parsedData) => {
-    setApiSuccess("✅ Data imported from Excel file successfully!");
-    setTimeout(() => setApiSuccess(null), 3000);
-
-    const newTeachers     = parsedData.teachers.map(t => ({ id: uid(), code: t.code, name: t.name }));
+    // 1. Teachers
+    const newTeachers = parsedData.teachers.map(t => ({ id: uid(), code: t.code, name: t.name }));
     setTeachers(newTeachers);
 
-    const newYearBranches = parsedData.yearBranches.map(yb => ({ ...yb, id: `${yb.year}-${yb.branch}` }));
+    // 2. Year-Branches
+    const newYearBranches = parsedData.yearBranches.map(yb => ({
+      id: `${yb.year}-${yb.branch}`, year: yb.year, branch: yb.branch, divs: yb.divs,
+    }));
     setYearBranches(newYearBranches);
 
-    const newBatchCount = {};
-    newYearBranches.forEach(yb => { newBatchCount[yb.id] = 3; });
+    // 3. Batch counts
+    const newBatchCount = { ...ybBatchCount };
+    newYearBranches.forEach(yb => {
+      if (!newBatchCount[yb.id]) newBatchCount[yb.id] = 3;
+    });
     setYbBatchCount(newBatchCount);
 
-    const newYbSubjects = {};
+    // 4. Subjects — assign fresh local IDs and build oldParsedId → newLocalId map
+    const newYbSubjects  = {};
+    const oldIdMap = {};   // oldIdMap[ybKey][parsedSubId] = newLocalId
+
     Object.entries(parsedData.subjects).forEach(([ybKey, subs]) => {
-      newYbSubjects[ybKey] = subs.map(s => ({ ...s, id: uid() }));
+      oldIdMap[ybKey] = {};
+      newYbSubjects[ybKey] = subs.map(parsedSub => {
+        const newId = uid();
+        oldIdMap[ybKey][parsedSub.id] = newId;
+        return {
+          id:        newId,
+          name:      parsedSub.name,
+          type:      parsedSub.type,
+          hours:     parsedSub.hours    || 0,
+          labHours:  parsedSub.labHours || 2,
+          weeklyLabs: parsedSub.weeklyLabs || 1,
+        };
+      });
     });
     setYbSubjects(newYbSubjects);
 
     if (newYearBranches.length > 0) setActiveSubYbId(newYearBranches[0].id);
 
+    // 5. Assignments — translate parsedSubId → newLocalId
     const newAssignments = {};
     Object.entries(parsedData.assignments).forEach(([ybKey, divMap]) => {
       newAssignments[ybKey] = {};
-      Object.entries(divMap).forEach(([div, subMap]) => {
+      const idBridge = oldIdMap[ybKey] || {};
+      Object.entries(divMap).forEach(([div, subAssignMap]) => {
         newAssignments[ybKey][div] = {};
-        const ybSubs = newYbSubjects[ybKey] || [];
-        Object.entries(subMap).forEach(([subName, teacherCode]) => {
-          const subObj = ybSubs.find(s => s.name === subName);
-          if (subObj) newAssignments[ybKey][div][subObj.id] = { teacherCode };
+        Object.entries(subAssignMap).forEach(([parsedSubId, assignVal]) => {
+          const newLocalId = idBridge[parsedSubId];
+          if (newLocalId && assignVal?.teacherCode) {
+            newAssignments[ybKey][div][newLocalId] = { teacherCode: assignVal.teacherCode };
+          }
         });
       });
     });
     setAssignments(newAssignments);
 
+    // 6. Counsellors — init empty per div
     const newCounsellors = {};
     newYearBranches.forEach(yb => {
       newCounsellors[yb.id] = {};
@@ -282,6 +294,8 @@ export default function GenerateTimetable() {
     });
     setDivCounsellors(newCounsellors);
 
+    setApiSuccess("✅ Data imported from Excel successfully! Teachers, subjects & assignments are pre-filled.");
+    setTimeout(() => setApiSuccess(null), 4000);
     setActiveTab(1);
   };
 
@@ -318,7 +332,7 @@ export default function GenerateTimetable() {
     setYbError("");
     const year = yearInput.trim().toUpperCase(), branch = branchInput.trim().toUpperCase();
     if (!year || !branch) { setYbError("Year and branch required."); return; }
-    const divs       = divInput.split(/[\s,]+/).map(norm).filter(Boolean);
+    const divs = divInput.split(/[\s,]+/).map(norm).filter(Boolean);
     if (!divs.length) { setYbError("Enter at least one division."); return; }
     const numBatches = parseInt(batchInput) || 3;
     if (numBatches < 1 || numBatches > 10) { setYbError("Batch count must be 1–10."); return; }
@@ -329,7 +343,11 @@ export default function GenerateTimetable() {
     setYbBatchCount(p => ({ ...p, [id]: numBatches }));
     const na = {}; divs.forEach(d => { na[d] = {}; });
     setAssignments(p => ({ ...p, [id]: na }));
-    setDivCounsellors(p => { const cur = { ...p }; cur[id] = {}; divs.forEach(d => { cur[id][d] = ""; }); return cur; });
+    setDivCounsellors(p => {
+      const cur = { ...p }; cur[id] = {};
+      divs.forEach(d => { cur[id][d] = ""; });
+      return cur;
+    });
     setBranchInput(""); setDivInput(""); setBatchInput("3");
   };
 
@@ -387,15 +405,12 @@ export default function GenerateTimetable() {
       });
     } catch (e) { setApiError(`Remove subject failed: ${e.message}`); return; }
     setYbSubjects(p => ({ ...p, [ybId]: updated }));
-    // clean up assignments for removed subject
     setAssignments(p => {
       const copy = { ...p };
       if (copy[ybId]) {
         const divsCopy = { ...copy[ybId] };
         Object.keys(divsCopy).forEach(div => {
-          const dc = { ...divsCopy[div] };
-          delete dc[subId];
-          divsCopy[div] = dc;
+          const dc = { ...divsCopy[div] }; delete dc[subId]; divsCopy[div] = dc;
         });
         copy[ybId] = divsCopy;
       }
@@ -466,40 +481,58 @@ export default function GenerateTimetable() {
   const setSubjectTeacher = (ybId, div, subId, teacherCode) =>
     setAssignments(p => ({
       ...p,
-      [ybId]: { ...p[ybId], [div]: { ...p[ybId]?.[div], [subId]: { ...(p[ybId]?.[div]?.[subId] || {}), teacherCode } } },
+      [ybId]: {
+        ...p[ybId],
+        [div]: {
+          ...(p[ybId]?.[div] || {}),
+          [subId]: { ...(p[ybId]?.[div]?.[subId] || {}), teacherCode },
+        },
+      },
     }));
 
   const setDivCounsellor = (ybId, div, teacherCode) =>
     setDivCounsellors(p => ({ ...p, [ybId]: { ...(p[ybId] || {}), [div]: teacherCode } }));
 
   // ── Generate ──────────────────────────────────────────────────────────────
+  /**
+   * FIX: Use generateAllTimetables() instead of calling generateTimetable() directly.
+   *
+   * The old code called:
+   *   generateTimetable(subs, divAssign, roomPools, numBatches, div, globalLabSlots)
+   * which passed globalLabSlots as the globalTeacherSlots parameter (wrong name, missing
+   * globalRoomSlots entirely). Also the new generateAllTimetables() runs normaliseAssignments()
+   * internally so teacher codes stored as objects or strings both work correctly.
+   */
   const handleGenerate = async () => {
     setApiError(null); setApiSuccess(null);
     if (!yearBranches.length)                                   { setApiError("Add at least one Year/Branch/Division."); return; }
     if (!yearBranches.some(yb => getYbSubs(yb.id).length > 0)) { setApiError("Add subjects for at least one Year-Branch."); return; }
     setGenerating(true);
 
-    const newAllTT = {}, globalLabSlots = {};
-    yearBranches.forEach(yb => {
-      const subs = getYbSubs(yb.id); if (!subs.length) return;
-      newAllTT[yb.id] = {};
-      const numBatches = getNumBatches(yb.id), roomPools = getRoomPools(yb.id);
-      yb.divs.forEach(div => {
-        const divAssign = {};
-        subs.forEach(sub => { const a = assignments?.[yb.id]?.[div]?.[sub.id] || {}; divAssign[sub.id] = { teacherCode: a.teacherCode || "" }; });
-        newAllTT[yb.id][div] = generateTimetable(subs, divAssign, roomPools, numBatches, div, globalLabSlots);
-      });
+    // Build roomPools map for all YBs
+    const roomPoolsMap = {};
+    yearBranches.forEach(yb => { roomPoolsMap[yb.id] = getRoomPools(yb.id); });
+
+    // ✅ FIX: generateAllTimetables handles normalisation, both conflict maps, and correct param order
+    const { allTimetables: newAllTT } = generateAllTimetables({
+      yearBranches,
+      ybSubjects,
+      ybBatchCount,
+      assignments,
+      roomPools: roomPoolsMap,
     });
 
     setAllTimetables(newAllTT);
     setTeacherTTs(buildTeacherTTs(newAllTT, teachers));
     setLabRoomTTs(buildLabRoomTTs(newAllTT));
     setGenerated(true);
-    setActiveTab(6); // generate tab is now index 6
+    setActiveTab(6);
 
+    // Save to server
     try {
       await apiPost("/teachers/bulk", teachers.map(t => ({ code: t.code, name: t.name })));
       await apiPost("/rooms/bulk",    rooms.map(r => ({ number: r.number, type: r.type })));
+
       for (const yb of yearBranches) {
         const ybSubs = getYbSubs(yb.id); if (!ybSubs.length) continue;
         await apiPost("/subjects/bulk", {
@@ -509,11 +542,16 @@ export default function GenerateTimetable() {
             ...(isCoreLab(s.type) ? { lab_hours: s.labHours } : {}),
           })),
         });
+
         const divA = {};
         yb.divs.forEach(div => {
           divA[div] = {};
-          ybSubs.forEach(sub => { const a = assignments?.[yb.id]?.[div]?.[sub.id]; divA[div][sub.name] = { teacher_code: a?.teacherCode || "", room: "" }; });
+          ybSubs.forEach(sub => {
+            const a = assignments?.[yb.id]?.[div]?.[sub.id];
+            divA[div][sub.name] = { teacher_code: a?.teacherCode || "", room: "" };
+          });
         });
+
         const ybTT = {};
         Object.entries(newAllTT[yb.id] || {}).forEach(([div, grid]) => {
           ybTT[div] = {};
@@ -526,14 +564,20 @@ export default function GenerateTimetable() {
                 subject:      cell.subject,
                 teacher_code: cell.teacherCode || "",
                 room:         cell.room || "",
-                batches:      cell.batches ? cell.batches.map(b => ({ batch: b.batch, teacher_code: b.teacherCode || "", room: b.room || "" })) : null,
+                batches: cell.batches
+                  ? cell.batches.map(b => ({ batch: b.batch, teacher_code: b.teacherCode || "", room: b.room || "" }))
+                  : null,
               };
             });
           });
         });
+
         await apiPost("/generate", {
           year: yb.year, branch: yb.branch, divisions: yb.divs,
-          subjects: ybSubs.map(s => ({ name: s.name, type: s.type, hours: s.hours, ...(isCoreLab(s.type) ? { lab_hours: s.labHours } : {}) })),
+          subjects: ybSubs.map(s => ({
+            name: s.name, type: s.type, hours: s.hours,
+            ...(isCoreLab(s.type) ? { lab_hours: s.labHours } : {}),
+          })),
           teacher_assignments: divA,
           timetables: ybTT,
         });
@@ -546,22 +590,35 @@ export default function GenerateTimetable() {
     }
   };
 
-  // ── Excel export ──────────────────────────────────────────────────────────
+  // ── Excel Export ──────────────────────────────────────────────────────────
   const buildSheet = (grid, ybLabel, div, ybId) => {
     const activeFooterRoles = getFooterRolesForDiv(ybId, div);
     const aoa = [
-      [], [],
-      [null, null, dept],
-      [null, null, `  Time Table ${semLabel}`],
-      [null, null, null, null, null, null, null, null, null, null, `${ybLabel}-${div}`],
+      // Header section with institution details
+      ["╔════════════════════════════════════════════════════════════════╗"],
+      ["║                    TIMETABLE INFORMATION                       ║"],
+      ["╚════════════════════════════════════════════════════════════════╝"],
+      [],
+      [dept],
+      [semLabel],
+      [`Year-Branch: ${ybLabel} | Division: ${div}`],
+      [],
+      // Main timetable header
       [null, null, "Day/Time", ...SLOTS.map(s => SLOT_LBL[s])],
       [],
     ];
+
     DAYS.forEach(day => {
-      const sr = [null, null, "Mon"], tc = [null, null, "Faculty"], rm = [null, null, "Room"];
+      // ✅ FIX: use actual day name, not hardcoded "Mon"
+      const sr = [null, null, day];
+      const tc = [null, null, "Faculty"];
+      const rm = [null, null, "Room"];
+
       SLOTS.forEach(slot => {
         const cell = grid[day]?.[slot];
-        if (slot === BREAK_SLOT) { sr.push("BREAK"); tc.push(null); rm.push(null); return; }
+        if (slot === BREAK_SLOT) {
+          sr.push("BREAK"); tc.push(null); rm.push(null); return;
+        }
         if (cell?.batches?.length) {
           sr.push(cell.batches.map(b => `${b.batch}:${b.subjectName}`).join(" | "));
           tc.push(cell.batches.map(b => `${b.batch}:${b.teacherCode || "—"}`).join(" | "));
@@ -571,48 +628,92 @@ export default function GenerateTimetable() {
           tc.push(cell.electives.map(e => `${e.name}:${e.teacherCode || "—"}`).join(" | "));
           rm.push(cell.electives.map(e => `${e.name}:${e.room || "—"}`).join(" | "));
         } else {
-          sr.push(cell?.subject || ""); tc.push(cell?.teacherCode || ""); rm.push(cell?.room || "");
+          sr.push(cell?.subject || "");
+          tc.push(cell?.teacherCode || "");  // ✅ always a plain string from generateAllTimetables
+          rm.push(cell?.room || "");
         }
       });
+
       aoa.push(sr, tc, rm, []);
     });
+
+    // Subject-teacher legend
     aoa.push([]);
-    const seen = new Set(); let n = 1;
+    aoa.push(["LEGEND: Subject, Faculty & Room Information"]);
+    aoa.push([]);
     aoa.push([null, null, "Sr. No.", "Subject", "Faculty Code", "Faculty Name", "Room/Lab"]);
+    const seen = new Set(); let n = 1;
+
     DAYS.forEach(day => SLOTS.forEach(slot => {
       const cell = grid[day]?.[slot];
-      if (!cell?.subject || cell.subject === "BREAK" || seen.has(cell.subject)) return;
+      if (!cell?.subject || cell.subject === "BREAK" || cell.subject === "REMEDIAL" || seen.has(cell.subject)) return;
       seen.add(cell.subject);
+
       if (cell.batches?.length) {
         const shownSubs = new Set();
         cell.batches.forEach(b => {
-          if (shownSubs.has(b.subjectName)) return; shownSubs.add(b.subjectName);
+          if (shownSubs.has(b.subjectName)) return;
+          shownSubs.add(b.subjectName);
           const tO = teachers.find(t => t.code === b.teacherCode);
           aoa.push([null, null, n++, b.subjectName, b.teacherCode || "", tO?.name || "", b.room || ""]);
         });
       } else if (cell.electives?.length) {
-        cell.electives.forEach(e => { const tO = teachers.find(t => t.code === e.teacherCode); aoa.push([null, null, n++, e.name, e.teacherCode || "", tO?.name || "", e.room || ""]); });
+        cell.electives.forEach(e => {
+          const tO = teachers.find(t => t.code === e.teacherCode);
+          aoa.push([null, null, n++, e.name, e.teacherCode || "", tO?.name || "", e.room || ""]);
+        });
       } else {
         const tO = teachers.find(t => t.code === cell.teacherCode);
         aoa.push([null, null, n++, cell.subject, cell.teacherCode || "", tO?.name || "", cell.room || ""]);
       }
     }));
+
+    // Footer
+    aoa.push([]);
+    aoa.push(["Generated on:", new Date().toLocaleDateString("en-IN", { year: "numeric", month: "long", day: "numeric" })]);
     aoa.push([]);
     const activeRoles = activeFooterRoles.filter(r => r.role && r.name);
-    const roleRow = [null, null], nameRow = [null, null];
-    activeRoles.forEach((r, i) => { if (i > 0) { roleRow.push(null, null); nameRow.push(null, null); } roleRow.push(r.role); nameRow.push(r.name); });
-    aoa.push(roleRow, nameRow);
+    if (activeRoles.length) {
+      aoa.push(["AUTHORIZATION SIGNATURES:"]);
+      aoa.push([]);
+      const roleRow = [null, null], nameRow = [null, null];
+      activeRoles.forEach((r, i) => {
+        if (i > 0) { roleRow.push(null, null); nameRow.push(null, null); }
+        roleRow.push(r.role); nameRow.push(r.name);
+      });
+      aoa.push(roleRow, [], nameRow);
+    }
+
     const ws = XLSX.utils.aoa_to_sheet(aoa);
-    ws["!cols"] = [{ wch: 2 }, { wch: 2 }, { wch: 14 }, ...SLOTS.map(() => ({ wch: 24 }))];
+    // Enhanced column widths for better appearance
+    ws["!cols"] = [
+      { wch: 2 },   // Margin
+      { wch: 2 },   // Margin
+      { wch: 16 },  // Day/Time column
+      ...SLOTS.map(() => ({ wch: 26 }))  // Slot columns - wider for better readability
+    ];
+    
+    // Set row heights for header rows
+    ws["!rows"] = [
+      { hpx: 20 }, // Row 1
+      { hpx: 18 }, // Row 2
+      { hpx: 20 }, // Row 3
+      { hpx: 16 }  // Row 4
+    ];
+    
     return ws;
   };
 
   const downloadAll = () => {
     const wb = XLSX.utils.book_new();
+
+    // Division sheets
     yearBranches.forEach(yb => yb.divs.forEach(div => {
       const grid = allTimetables[yb.id]?.[div];
       if (grid) XLSX.utils.book_append_sheet(wb, buildSheet(grid, yb.id, div, yb.id), `${yb.id}-${div}`.slice(0, 31));
     }));
+
+    // Teacher sheets
     teachers.forEach(t => {
       const ttG = teacherTTs[t.code]; if (!ttG) return;
       const aoa = [
@@ -626,7 +727,9 @@ export default function GenerateTimetable() {
         SLOTS.forEach(slot => {
           if (slot === BREAK_SLOT) { row.push("BREAK"); return; }
           const items = ttG[day]?.[slot] || [];
-          row.push(items.map(it => `${it.subject}(${it.ybLabel}/Div${it.div}${it.batch ? `/${it.batch}` : ""}${it.room ? `[${it.room}]` : ""})`).join(" | "));
+          row.push(items.map(it =>
+            `${it.subject}(${it.ybLabel}/Div${it.div}${it.batch ? `/${it.batch}` : ""}${it.room ? `[${it.room}]` : ""})`
+          ).join(" | "));
         });
         aoa.push(row, []);
       });
@@ -634,6 +737,7 @@ export default function GenerateTimetable() {
       ws["!cols"] = [{ wch: 2 }, { wch: 2 }, { wch: 14 }, ...SLOTS.map(() => ({ wch: 26 }))];
       XLSX.utils.book_append_sheet(wb, ws, `T-${t.code.replace(/[/\s]+/g, "_")}`.slice(0, 31));
     });
+
     XLSX.writeFile(wb, `Timetables_${dept.replace(/\s+/g, "_")}.xlsx`);
   };
 
@@ -642,6 +746,23 @@ export default function GenerateTimetable() {
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, buildSheet(grid, ybId, div, ybId), `${ybId}-${div}`);
     XLSX.writeFile(wb, `TT_${ybId}_Div${div}.xlsx`);
+  };
+
+  const downloadSinglePDF = (ybId, div) => {
+    const grid = allTimetables[ybId]?.[div];
+    if (!grid) return;
+    const footerRoles = getFooterRolesForDiv(ybId, div);
+    generatePDF(grid, `${ybId} — Division ${div}`, dept, semLabel, teachers, footerRoles);
+  };
+
+  const downloadAllPDF = () => {
+    yearBranches.forEach(yb => {
+      yb.divs.forEach(div => {
+        const grid = allTimetables[yb.id]?.[div];
+        if (!grid) return;
+        setTimeout(() => downloadSinglePDF(yb.id, div), 500);
+      });
+    });
   };
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -653,7 +774,13 @@ export default function GenerateTimetable() {
 
       <div style={S.tabBar}>
         {TABS.map((t, i) => (
-          <button key={i} onClick={() => setActiveTab(i)} style={{ ...S.tab, ...(activeTab === i ? S.tabActive : {}) }}>{t}</button>
+          <button
+            key={i}
+            onClick={() => setActiveTab(i)}
+            style={{ ...S.tab, ...(activeTab === i ? S.tabActive : {}) }}
+          >
+            {t}
+          </button>
         ))}
       </div>
 
@@ -715,8 +842,10 @@ export default function GenerateTimetable() {
           addTeacher={addTeacher}
           updateTeacher={updateTeacher}
           removeTeacher={removeTeacher}
-          yearBranches={yearBranches} ybSubjects={ybSubjects}
-          ybBatchCount={ybBatchCount} assignments={assignments}
+          yearBranches={yearBranches}
+          ybSubjects={ybSubjects}
+          ybBatchCount={ybBatchCount}
+          assignments={assignments}
           setSubjectTeacher={setSubjectTeacher}
           setActiveTab={setActiveTab}
         />
@@ -739,10 +868,12 @@ export default function GenerateTimetable() {
         <Step6Generate
           dept={dept} semLabel={semLabel}
           rooms={rooms} yearBranches={yearBranches} teachers={teachers}
-          allTimetables={allTimetables} teacherTTs={teacherTTs} labRoomTTs={labRoomTTs}
+          allTimetables={allTimetables} teacherTTs={teacherTTs}
+          labRoomTTs={labRoomTTs} classroomTTs={classroomTTs}
           generated={generated} generating={generating}
           handleGenerate={handleGenerate}
           downloadAll={downloadAll} downloadSingle={downloadSingle}
+          downloadAllPDF={downloadAllPDF} downloadSinglePDF={downloadSinglePDF}
           getFooterRolesForDiv={getFooterRolesForDiv}
           setActiveTab={setActiveTab}
         />

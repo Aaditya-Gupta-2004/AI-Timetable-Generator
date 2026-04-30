@@ -23,7 +23,13 @@ export const SLOT_LBL  = {
 export const CORE_LAB_TYPES  = ["Core Lab 1", "Core Lab 2", "Core Lab 3"];
 export const isCoreLab       = t => CORE_LAB_TYPES.includes(t);
 export const ELECTIVE_GROUPS = ["Elective 1", "Elective 2", "Elective 3", "Elective 4", "Elective 5"];
-export const isElectiveType  = t => ELECTIVE_GROUPS.includes(t);
+export const isElectiveType  = t => {
+  // Recognizes standard electives and new types from Loadallocationuploader
+  if (ELECTIVE_GROUPS.includes(t)) return true;
+  // Match Elective-MINOR, Elective-DLO1 through Elective-DLO6, and other dynamic electives
+  if (/^Elective-/.test(t)) return true;
+  return false;
+};
 
 export const uid        = () => Math.random().toString(36).slice(2, 8);
 export const norm       = s  => s.trim().toUpperCase();
