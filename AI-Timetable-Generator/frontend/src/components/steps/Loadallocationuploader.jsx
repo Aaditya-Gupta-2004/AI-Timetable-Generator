@@ -2,51 +2,25 @@ import React, { useState } from "react";
 import * as XLSX from "xlsx";
 
 /**
- * LoadAllocationUploader — v3 (Elective-aware + Load-capped)
+ * LoadAllocationUploader — v5
  *
- * KEY CHANGES FROM v2:
+ * KEY CHANGES FROM v4:
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * 1. ELECTIVE SUBJECTS NOW EXTRACTED (was wrongly skipped before)
- *    - TE-DLO1 … TE-DLO6  → elective type "Elective-DLO1" … "Elective-DLO6"
- *    - TE-MINOR / TE-minor → elective type "Elective-MINOR" for TE year
- *    - MINOR-SE            → elective type "Elective-MINOR" for SE year
- *    - Electives are shared across ALL divs of their year (A, B, C …)
- *      so they are stored once per ybKey with ALL divs assigned.
- *    - Each DLO group is independent — students pick one DLO.
- *    - In the timetable these map to the "electives" cell type already
- *      supported by the generator (cell.electives array).
+ * 1. MINOR LAB FOR ALL YEARS
+ *    - classifyYD now recognises BE-MINOR, TE-MINOR, SE-MINOR (and their
+ *      lab rows) and maps them to the correct year's elective group "MINOR".
+ *    - Previously only TE-MINOR and MINOR-SE were handled; BE-MINOR was
+ *      silently dropped.
  *
- * 2. TEACHER TOTAL LOAD ENFORCED
- *    - The "Total Load" column is read per teacher (Sr# row).
- *    - Each subject row that is processed adds its hours to a running
- *      tally for that teacher.
- *    - Once the tally reaches (or would exceed) the declared total,
- *      remaining rows for that teacher are still parsed for subject/
- *      assignment data but flagged — and the timetable generator
- *      should respect the cap when scheduling.
- *    - The parsed teacher object now carries { code, name, totalLoad,
- *      assignedLoad } so the UI can show a warning when load is exceeded.
- *
- * 3. SKIP LOGIC TIGHTENED
- *    - Only these patterns are skipped: BCA, FE, Mtech / M.Tech
- *    - Everything else (SE, TE, MINOR-SE, TE-DLO*, TE-MINOR) is processed.
- *
- * 4. ELECTIVE ASSIGNMENT SHAPE
- *    - assignments[ybKey][div][subId] = { teacherCode }
- *      same shape as theory/lab — the generator already handles electives
- *      in the Step4Teachers assignment table.
- *
- * OUTPUT SHAPE (unchanged prop interface):
- *   onDataParsed({
- *     teachers:     [{ code, name, totalLoad, assignedLoad }],
- *     yearBranches: [{ id, year, branch, divs }],
- *     subjects:     { [ybKey]: [{ id, name, type, hours, labHours }] },
- *     assignments:  { [ybKey]: { [div]: { [subId]: { teacherCode } } } },
- *   })
+ * 2. CONSISTENT ELECTIVE-LAB TYPE
+ *    - All MINOR/DLO lab subjects get type "Elective-MINOR-Lab" /
+ *      "Elective-DLO1-Lab" etc. — matching isElectiveLab() in
+ *      timetableHelpers.js exactly.
  */
 
 const uid = () => Math.random().toString(36).slice(2, 9);
+const DEFAULT_BATCHES_PER_DIV = 3;
 
 // ─── Styles ──────────────────────────────────────────────────────────────────
 const S = {
@@ -63,9 +37,9 @@ const S = {
   td:         { padding: "6px 10px", border: "1px solid #e2e8f0", fontSize: 12 },
   sectionHdr: { fontWeight: 700, fontSize: 13, color: "#1a2b4a", marginTop: 20, marginBottom: 8 },
   chip: (type) => {
-    if (type === "theory")        return { padding: "2px 8px", borderRadius: 12, fontSize: 10, fontWeight: 700, background: "#f0f4ff", color: "#3451b2", border: "1px solid #c5d3f5" };
-    if (type.startsWith("Core")) return { padding: "2px 8px", borderRadius: 12, fontSize: 10, fontWeight: 700, background: "#f0fff4", color: "#276749", border: "1px solid #9ae6b4" };
-    // elective
+    if (type === "theory")               return { padding: "2px 8px", borderRadius: 12, fontSize: 10, fontWeight: 700, background: "#f0f4ff", color: "#3451b2", border: "1px solid #c5d3f5" };
+    if (type.startsWith("Core"))         return { padding: "2px 8px", borderRadius: 12, fontSize: 10, fontWeight: 700, background: "#f0fff4", color: "#276749", border: "1px solid #9ae6b4" };
+    if (/-Lab$/.test(type))              return { padding: "2px 8px", borderRadius: 12, fontSize: 10, fontWeight: 700, background: "#f0f0ff", color: "#3730a3", border: "1px solid #c7d2fe" };
     return { padding: "2px 8px", borderRadius: 12, fontSize: 10, fontWeight: 700, background: "#fff8f0", color: "#9c4221", border: "1px solid #fbd38d" };
   },
 };
@@ -93,17 +67,29 @@ function toNum(val) {
   return isNaN(n) ? 0 : Math.floor(Math.abs(n));
 }
 
+function getBatchesForDiv(div, count = DEFAULT_BATCHES_PER_DIV) {
+  return Array.from({ length: count }, (_, i) => `${div}${i + 1}`);
+}
+
+function getLabBatchCount(prHrs, warnings, contextLabel) {
+  if (prHrs <= 0) return 0;
+  if (prHrs % 2 !== 0) {
+    warnings.push(`${contextLabel}: practical load ${prHrs}h is not divisible by 2, so batch coverage was rounded down.`);
+  }
+  return Math.floor(prHrs / 2);
+}
+
 // ─── Row classifier ───────────────────────────────────────────────────────────
 /**
  * Classify a Year-Div cell value.
  *
  * Returns one of:
- *   { kind: "skip" }                                    — BCA / FE / Mtech
- *   { kind: "theory", targets: [{year,branch,div}] }   — SE-A, TE-B-C, etc.
- *   { kind: "lab",    targets: [{year,branch,div}] }   — same, practical-only
- *   { kind: "elective", year, branch, electiveGroup }  — TE-DLO1, TE-MINOR, MINOR-SE
+ *   { kind: "skip" }
+ *   { kind: "regular", targets: [{year, branch, div}] }
+ *   { kind: "elective", year, branch, electiveGroup }
  *
- * (theory/lab distinction is done later based on thHrs/prHrs)
+ * MINOR is now supported for SE, TE, and BE.
+ * DLO1–DLO6 remain TE-only (as per curriculum).
  */
 function classifyYD(raw) {
   const str = String(raw || "").trim();
@@ -113,19 +99,21 @@ function classifyYD(raw) {
   if (/^(BCA|FE|Mtech|M\.Tech)$/i.test(str)) return { kind: "skip" };
 
   // ── DLO electives: TE-DLO1 … TE-DLO6 ──
-  const dloMatch = str.match(/^TE-(DLO\d+)$/i);
+  const dloMatch = str.match(/^TE-(DLO\d+)(?:[-\s].*)?$/i);
   if (dloMatch) {
     return { kind: "elective", year: "TE", branch: "IT", electiveGroup: dloMatch[1].toUpperCase() };
   }
 
-  // ── MINOR electives for TE ──
-  if (/^TE-MINOR$/i.test(str) || /^TE-minor$/i.test(str)) {
-    return { kind: "elective", year: "TE", branch: "IT", electiveGroup: "MINOR" };
-  }
+  // ── MINOR electives — all years: TE-MINOR, SE-MINOR, BE-MINOR ──
+  // Also handles legacy patterns: MINOR-SE, MINOR-TE, MINOR-BE
+  const minorMatch =
+    str.match(/^(SE|TE|BE)-MINOR(?:[-\s].*)?$/i) ||   // SE-MINOR, TE-MINOR, BE-MINOR
+    str.match(/^MINOR-(SE|TE|BE)(?:[-\s].*)?$/i);     // MINOR-SE, MINOR-TE, MINOR-BE
 
-  // ── MINOR electives for SE ──
-  if (/^MINOR-SE$/i.test(str)) {
-    return { kind: "elective", year: "SE", branch: "IT", electiveGroup: "MINOR" };
+  if (minorMatch) {
+    // minorMatch[1] is the year in both patterns
+    const year = minorMatch[1].toUpperCase();
+    return { kind: "elective", year, branch: "IT", electiveGroup: "MINOR" };
   }
 
   // ── Regular SE / TE / BE theory/lab rows ──
@@ -135,7 +123,6 @@ function classifyYD(raw) {
   const year = m[1].toUpperCase();
   const rest = m[2];
 
-  // Extract single-letter division tokens
   const divs = rest
     .split(/[-\s,]+/)
     .map(d => d.trim())
@@ -192,17 +179,15 @@ export function parseWorkbook(workbook) {
   if (loadIdx < 0) warnings.push("'Total Load' column not found — load cap won't be enforced.");
 
   // ── Data structures ───────────────────────────────────────────────────────
-  const teachers    = new Map();   // code → { code, name, totalLoad, usedLoad }
-  const usedCodes   = new Set();
-  const yearBranches = new Map();  // ybKey → { year, branch, divs: Set }
-  const ybSubjects  = new Map();   // ybKey → Map<subName, subObj>
-  const assignments = new Map();   // ybKey → Map<div, Map<subId, {teacherCode}>>
-  const labOrder    = new Map();   // ybKey → Map<labName, "Core Lab N">
+  const teachers     = new Map();
+  const usedCodes    = new Set();
+  const yearBranches = new Map();
+  const ybSubjects   = new Map();
+  const assignments  = new Map();
+  const labOrder     = new Map();
 
-  // Elective registries (keyed by ybKey + electiveGroup)
-  // electiveKey = `${ybKey}::${electiveGroup}`
-  const electiveSubjects = new Map(); // electiveKey → Map<subName, subObj>
-  const electiveAssign   = new Map(); // electiveKey → Map<subId, {teacherCode}>
+  const electiveSubjects = new Map();
+  const electiveAssign   = new Map();
 
   let curTeacher  = null;
   let skippedRows = 0;
@@ -259,49 +244,73 @@ export function parseWorkbook(workbook) {
       continue;
     }
 
-    // ── ELECTIVE (DLO / MINOR) ────────────────────────────────────────────
+    // ── ELECTIVE (DLO / MINOR — all years) ───────────────────────────────
     if (cls.kind === "elective") {
       const { year, branch, electiveGroup } = cls;
       const ybKey       = `${year}-${branch}`;
       const electiveKey = `${ybKey}::${electiveGroup}`;
 
-      // Ensure the YB exists (divs populated later from regular rows,
-      // or we add a placeholder that gets merged)
       ensureYB(ybKey, year, branch);
 
       if (!electiveSubjects.has(electiveKey)) electiveSubjects.set(electiveKey, new Map());
       if (!electiveAssign.has(electiveKey))   electiveAssign.set(electiveKey, new Map());
 
-      const eSubMap  = electiveSubjects.get(electiveKey);
-      const eAssign  = electiveAssign.get(electiveKey);
-      const subLabel = rawSub; // e.g. "ANLP", "BI", "Game Development"
+      const eSubMap = electiveSubjects.get(electiveKey);
+      const eAssign = electiveAssign.get(electiveKey);
+      const subLabel = rawSub;
 
-      // Full key includes group to namespace identical names across groups
-      const fullName = `[${electiveGroup}] ${subLabel}`;
+      // ── Theory elective subject ──────────────────────────────────────────
+      if (thHrs > 0) {
+        const fullName = `[${electiveGroup}] ${subLabel}`;
 
-      if (!eSubMap.has(fullName)) {
-        eSubMap.set(fullName, {
-          id:       uid(),
-          name:     fullName,
-          type:     `Elective-${electiveGroup}`,
-          hours:    thHrs,
-          labHours: prHrs > 0 ? 2 : 0,
-          electiveGroup,
-        });
-      } else {
-        const ex = eSubMap.get(fullName);
-        if (thHrs > ex.hours)   ex.hours   = thHrs;
-        if (prHrs > 0)          ex.labHours = 2;
+        if (!eSubMap.has(fullName)) {
+          eSubMap.set(fullName, {
+            id:           uid(),
+            name:         fullName,
+            type:         `Elective-${electiveGroup}`,
+            hours:        thHrs,
+            labHours:     0,
+            electiveGroup,
+          });
+        } else {
+          const ex = eSubMap.get(fullName);
+          if (thHrs > ex.hours) ex.hours = thHrs;
+        }
+
+        const eSub = eSubMap.get(fullName);
+        if (!eAssign.has(eSub.id)) {
+          eAssign.set(eSub.id, { teacherCode: curTeacher.code });
+        }
       }
 
-      const eSub = eSubMap.get(fullName);
-      // First-teacher-wins for this elective subject
-      if (!eAssign.has(eSub.id)) {
-        eAssign.set(eSub.id, { teacherCode: curTeacher.code });
+      // ── Elective LAB subject ─────────────────────────────────────────────
+      // Type pattern "Elective-{GROUP}-Lab" matches isElectiveLab() in timetableHelpers.js
+      if (prHrs > 0) {
+        const labFullName = `[${electiveGroup}] ${subLabel} Lab`;
+        const labType     = `Elective-${electiveGroup}-Lab`;
+
+        if (!eSubMap.has(labFullName)) {
+          eSubMap.set(labFullName, {
+            id:            uid(),
+            name:          labFullName,
+            type:          labType,
+            hours:         0,
+            labHours:      2,
+            electiveGroup,
+            isElectiveLab: true,
+          });
+        } else {
+          const ex = eSubMap.get(labFullName);
+          ex.labHours = 2;
+        }
+
+        const eLabSub = eSubMap.get(labFullName);
+        if (!eAssign.has(eLabSub.id)) {
+          eAssign.set(eLabSub.id, { teacherCode: curTeacher.code });
+        }
       }
 
-      // Track load contribution
-      const hrs = thHrs + (prHrs > 0 ? 2 : 0);
+      const hrs = thHrs + (prHrs > 0 ? prHrs : 0);
       curTeacher.usedLoad += hrs;
       continue;
     }
@@ -315,7 +324,7 @@ export function parseWorkbook(workbook) {
         ensureYB(ybKey, year, branch);
         ensureDiv(ybKey, div);
 
-        const subMap   = ybSubjects.get(ybKey);
+        const subMap    = ybSubjects.get(ybKey);
         const divAssign = assignments.get(ybKey).get(div);
 
         // Theory
@@ -343,24 +352,45 @@ export function parseWorkbook(workbook) {
             subMap.set(labName, { id: uid(), name: labName, type: labType, hours: 0, labHours: 2 });
           }
           const labSub = subMap.get(labName);
-          if (!divAssign.has(labSub.id)) divAssign.set(labSub.id, { teacherCode: curTeacher.code });
+          const existing = divAssign.get(labSub.id) || { teacherCode: "", batchAssigns: [] };
+          const batchAssigns = Array.isArray(existing.batchAssigns) ? [...existing.batchAssigns] : [];
+          const allBatches = getBatchesForDiv(div);
+          const batchSlots = getLabBatchCount(prHrs, warnings, `${rawYD} / ${rawSub} / ${curTeacher.name}`);
+
+          let assignedHere = 0;
+          for (const batch of allBatches) {
+            if (assignedHere >= batchSlots) break;
+            if (batchAssigns.some(b => b.batch === batch)) continue;
+            batchAssigns.push({ batch, teacherCode: curTeacher.code, room: "" });
+            assignedHere++;
+          }
+
+          if (assignedHere < batchSlots) {
+            warnings.push(
+              `${rawYD} / ${rawSub}: ${curTeacher.name} has ${prHrs}h practical load, but only ${assignedHere} batch slot(s) were available in Div ${div}.`
+            );
+          }
+
+          const uniqueCodes = [...new Set(batchAssigns.map(b => b.teacherCode).filter(Boolean))];
+          divAssign.set(labSub.id, {
+            teacherCode: uniqueCodes.length === 1 ? uniqueCodes[0] : "",
+            batchAssigns,
+          });
         }
       });
 
-      // Track load
-      const hrs = thHrs + (prHrs > 0 ? prHrs : 0);
-      curTeacher.usedLoad += hrs;
+      curTeacher.usedLoad += thHrs + (prHrs > 0 ? prHrs : 0);
     }
   }
 
   // ── Merge electives into ybSubjects + assignments ─────────────────────────
-  // Elective subjects are added to the ybKey they belong to,
-  // and assigned to ALL divs of that year (since electives are for whole year).
   electiveSubjects.forEach((eSubMap, electiveKey) => {
     const [ybKey] = electiveKey.split("::");
-    const eAssign  = electiveAssign.get(electiveKey) || new Map();
+    const eAssign = electiveAssign.get(electiveKey) || new Map();
 
-    ensureYB(ybKey, ...ybKey.split("-"));  // year, branch
+    if (!ybSubjects.has(ybKey))  ybSubjects.set(ybKey, new Map());
+    if (!assignments.has(ybKey)) assignments.set(ybKey, new Map());
+
     const subMap = ybSubjects.get(ybKey);
     const ybInfo = yearBranches.get(ybKey);
 
@@ -368,7 +398,6 @@ export function parseWorkbook(workbook) {
       if (!subMap.has(name)) subMap.set(name, sub);
     });
 
-    // Assign elective to all known divs (use first-assigned teacher)
     const divMap = assignments.get(ybKey);
     if (divMap && ybInfo) {
       ybInfo.divs.forEach(div => {
@@ -377,32 +406,50 @@ export function parseWorkbook(workbook) {
         eSubMap.forEach((sub) => {
           const assignVal = eAssign.get(sub.id);
           if (assignVal && !divAssign.has(sub.id)) {
-            divAssign.set(sub.id, assignVal);
+            divAssign.set(sub.id, { ...assignVal });
           }
         });
       });
     }
   });
 
-  // ── Backfill lab assignments across divs ──────────────────────────────────
+  // ── Backfill core lab assignments across divs ─────────────────────────────
   assignments.forEach((divMap, ybKey) => {
     const subMap  = ybSubjects.get(ybKey) || new Map();
     const labSubs = [...subMap.values()].filter(s => s.type.startsWith("Core Lab"));
-    const labCodes = new Map();
+    const labAssignPools = new Map();
+
     divMap.forEach(divAssign => {
       labSubs.forEach(ls => {
         const a = divAssign.get(ls.id);
-        if (a?.teacherCode) {
-          if (!labCodes.has(ls.id)) labCodes.set(ls.id, []);
-          labCodes.get(ls.id).push(a.teacherCode);
+        if (a?.batchAssigns?.length) {
+          if (!labAssignPools.has(ls.id)) labAssignPools.set(ls.id, []);
+          labAssignPools.get(ls.id).push(...a.batchAssigns);
+        } else if (a?.teacherCode) {
+          if (!labAssignPools.has(ls.id)) labAssignPools.set(ls.id, []);
+          labAssignPools.get(ls.id).push({ batch: "", teacherCode: a.teacherCode, room: "" });
         }
       });
     });
-    divMap.forEach(divAssign => {
+
+    divMap.forEach((divAssign, div) => {
       labSubs.forEach(ls => {
         if (!divAssign.has(ls.id)) {
-          const pool = labCodes.get(ls.id);
-          if (pool?.length) divAssign.set(ls.id, { teacherCode: pool[0] });
+          const pool = labAssignPools.get(ls.id);
+          if (pool?.length) {
+            const exactBatches = pool.filter(p => p.batch);
+            const remappedBatchAssigns = exactBatches.length
+              ? getBatchesForDiv(div).slice(0, exactBatches.length).map((batch, idx) => ({
+                  batch,
+                  teacherCode: exactBatches[idx]?.teacherCode || "",
+                  room:        exactBatches[idx]?.room || "",
+                }))
+              : [];
+            divAssign.set(ls.id, {
+              teacherCode: remappedBatchAssigns.length ? "" : (pool[0]?.teacherCode || ""),
+              batchAssigns: remappedBatchAssigns,
+            });
+          }
         }
       });
     });
@@ -419,58 +466,11 @@ export function parseWorkbook(workbook) {
 
   // ── Filter teachers to only those with IT-UG assignments ─────────────────
   const usedCodes2 = new Set();
-  assignments.forEach(divMap => divMap.forEach(da => da.forEach(v => { if (v?.teacherCode) usedCodes2.add(v.teacherCode); })));
-  // Also include teachers assigned to electives
+  assignments.forEach(divMap => divMap.forEach(da => da.forEach(v => {
+    if (v?.teacherCode) usedCodes2.add(v.teacherCode);
+    if (v?.batchAssigns?.length) v.batchAssigns.forEach(b => { if (b?.teacherCode) usedCodes2.add(b.teacherCode); });
+  })));
   electiveAssign.forEach(eAssign => eAssign.forEach(v => { if (v?.teacherCode) usedCodes2.add(v.teacherCode); }));
-
-  // ── MERGE ELECTIVES INTO REGULAR SUBJECTS AND ASSIGNMENTS ─────────────────
-  // Electives are stored separately but must be merged into ybSubjects/assignments
-  // before serialization so they're included in the output
-  electiveSubjects.forEach((eSubMap, electiveKey) => {
-    const [ybKey, electiveGroup] = electiveKey.split("::");
-    
-    // Ensure this yb exists in ybSubjects and assignments
-    if (!ybSubjects.has(ybKey)) {
-      ybSubjects.set(ybKey, new Map());
-    }
-    if (!assignments.has(ybKey)) {
-      assignments.set(ybKey, new Map());
-    }
-    
-    const ybSubMap = ybSubjects.get(ybKey);
-    const ybAssign = assignments.get(ybKey);
-    
-    // Merge elective subjects into ybSubjects[ybKey]
-    eSubMap.forEach((eSub, fullName) => {
-      if (!ybSubMap.has(fullName)) {
-        ybSubMap.set(fullName, { ...eSub }); // eSub already has id, name, type, hours, labHours
-      }
-    });
-    
-    // Get the assignments for this elective group
-    const eAssign = electiveAssign.get(electiveKey) || new Map();
-    
-    // Electives are shared across ALL divisions of the year-branch
-    // so we need to add them to every division's assignments
-    const ybEntry = yearBranches.get(ybKey);
-    if (ybEntry && ybEntry.divs.size > 0) {
-      ybEntry.divs.forEach(div => {
-        if (!ybAssign.has(div)) {
-          ybAssign.set(div, new Map());
-        }
-        const divAssign = ybAssign.get(div);
-        
-        // Add all elective subject assignments to this division
-        eSubMap.forEach((eSub, fullName) => {
-          // Use the assignment from electiveAssign if available, otherwise no teacher
-          const eAssignVal = eAssign.get(eSub.id);
-          if (eAssignVal) {
-            divAssign.set(eSub.id, { ...eAssignVal });
-          }
-        });
-      });
-    }
-  });
 
   // ── Serialise ─────────────────────────────────────────────────────────────
   const teachersArr = [...teachers.values()]
@@ -479,7 +479,7 @@ export function parseWorkbook(workbook) {
 
   const yearBranchArr = [...yearBranches.entries()]
     .map(([id, d]) => ({ id, year: d.year, branch: d.branch, divs: [...d.divs].sort() }))
-    .filter(yb => yb.divs.length > 0)   // skip year-branches with no actual divs
+    .filter(yb => yb.divs.length > 0)
     .sort((a, b) => {
       const order = { SE: 0, TE: 1, BE: 2 };
       return (order[a.year] ?? 9) - (order[b.year] ?? 9);
@@ -538,7 +538,6 @@ export default function LoadAllocationUploader({ onDataParsed }) {
   const handleApply = () => {
     if (parsed && onDataParsed) {
       const { _meta, ...clean } = parsed;
-      // Strip internal load fields from teachers before passing upstream
       clean.teachers = clean.teachers.map(({ code, name }) => ({ code, name }));
       onDataParsed(clean);
     }
@@ -548,26 +547,46 @@ export default function LoadAllocationUploader({ onDataParsed }) {
   const allTeachersForSub = (ybKey, subId) => {
     const codes   = new Set();
     const divMap  = parsed?.assignments[ybKey] || {};
-    Object.values(divMap).forEach(da => { if (da[subId]?.teacherCode) codes.add(da[subId].teacherCode); });
+    Object.values(divMap).forEach(da => {
+      const assign = da[subId];
+      if (assign?.teacherCode) codes.add(assign.teacherCode);
+      if (assign?.batchAssigns?.length) assign.batchAssigns.forEach(b => { if (b?.teacherCode) codes.add(b.teacherCode); });
+    });
     return [...codes].map(c => {
       const t = parsed.teachers.find(x => x.code === c);
       return t ? `${c} — ${t.name}` : c;
     });
   };
 
-  const totalTheory    = parsed ? Object.values(parsed.subjects).reduce((s, a) => s + a.filter(x => x.type === "theory").length,              0) : 0;
-  const totalLabs      = parsed ? Object.values(parsed.subjects).reduce((s, a) => s + a.filter(x => x.type.startsWith("Core Lab")).length,     0) : 0;
-  const totalElectives = parsed ? Object.values(parsed.subjects).reduce((s, a) => s + a.filter(x => x.type.startsWith("Elective-")).length,    0) : 0;
+  const assignmentLabel = (assign, isLab) => {
+    if (!assign) return null;
+    if (isLab && assign.batchAssigns?.length) {
+      return assign.batchAssigns.map(b => {
+        const t = parsed.teachers.find(x => x.code === b.teacherCode);
+        return `${b.batch}: ${b.teacherCode}${t ? ` — ${t.name}` : ""}`;
+      });
+    }
+    if (!assign.teacherCode) return null;
+    const t = parsed.teachers.find(x => x.code === assign.teacherCode);
+    return [`${assign.teacherCode}${t ? ` — ${t.name}` : ""}`];
+  };
 
-  // Group elective subjects by their electiveGroup for display
+  const totalTheory       = parsed ? Object.values(parsed.subjects).reduce((s, a) => s + a.filter(x => x.type === "theory").length, 0) : 0;
+  const totalLabs         = parsed ? Object.values(parsed.subjects).reduce((s, a) => s + a.filter(x => x.type.startsWith("Core Lab")).length, 0) : 0;
+  const totalElectives    = parsed ? Object.values(parsed.subjects).reduce((s, a) => s + a.filter(x => /^Elective-/.test(x.type) && !/-Lab$/.test(x.type)).length, 0) : 0;
+  const totalElectiveLabs = parsed ? Object.values(parsed.subjects).reduce((s, a) => s + a.filter(x => /-Lab$/.test(x.type)).length, 0) : 0;
+
   const electiveGroups = parsed
     ? Object.entries(parsed.subjects).flatMap(([ybKey, subs]) =>
-        [...new Set(subs.filter(s => s.type.startsWith("Elective-")).map(s => s.electiveGroup))]
-          .map(g => ({ ybKey, group: g, subs: subs.filter(s => s.electiveGroup === g) }))
+        [...new Set(subs.filter(s => /^Elective-/.test(s.type)).map(s => s.electiveGroup))].map(g => ({
+          ybKey,
+          group: g,
+          theorySubs: subs.filter(s => s.electiveGroup === g && !/-Lab$/.test(s.type)),
+          labSubs:    subs.filter(s => s.electiveGroup === g && /-Lab$/.test(s.type)),
+        }))
       )
     : [];
 
-  // Load overrun teachers
   const overloadedTeachers = parsed
     ? parsed.teachers.filter(t => t.totalLoad > 0 && t.usedLoad > t.totalLoad)
     : [];
@@ -582,7 +601,8 @@ export default function LoadAllocationUploader({ onDataParsed }) {
         Upload the faculty load allocation Excel file.<br />
         <strong>Theory Total</strong> = lectures/week &nbsp;|&nbsp;
         <strong>Practical-Load</strong> &gt; 0 → Core Lab (2 hrs/session).<br />
-        <strong>DLO1–DLO6 &amp; MINOR</strong> subjects are extracted as <em>Elective</em> subjects.<br />
+        <strong>DLO1–DLO6</strong> (TE) &amp; <strong>MINOR</strong> (SE/TE/BE) theory → <em>Elective-theory</em>;<br />
+        <strong>DLO1–DLO6</strong> (TE) &amp; <strong>MINOR</strong> (SE/TE/BE) practical → <em>Elective-Lab</em> (2-hr block).<br />
         BCA / FE / Mtech rows are automatically skipped.
       </p>
 
@@ -608,7 +628,6 @@ export default function LoadAllocationUploader({ onDataParsed }) {
 
       {parsed && (
         <>
-          {/* Warnings */}
           {parsed._meta?.warnings?.length > 0 && (
             <div style={S.warnBox}>
               <strong>⚠️ Warnings:</strong>
@@ -618,7 +637,6 @@ export default function LoadAllocationUploader({ onDataParsed }) {
             </div>
           )}
 
-          {/* Load overrun alert */}
           {overloadedTeachers.length > 0 && (
             <div style={{ ...S.warnBox, marginTop: 8 }}>
               <strong>🔴 Load Exceeded:</strong>
@@ -643,12 +661,15 @@ export default function LoadAllocationUploader({ onDataParsed }) {
               </li>
               <li>
                 {Object.values(parsed.subjects).reduce((s, a) => s + a.length, 0)} subjects —&nbsp;
-                {totalTheory} theory &nbsp;|&nbsp; {totalLabs} labs &nbsp;|&nbsp; {totalElectives} electives
+                {totalTheory} theory &nbsp;|&nbsp; {totalLabs} core labs &nbsp;|&nbsp;
+                {totalElectives} elective theory &nbsp;|&nbsp; {totalElectiveLabs} elective labs
               </li>
               {electiveGroups.length > 0 && (
                 <li>
                   Elective groups:&nbsp;
-                  {electiveGroups.map(eg => `${eg.ybKey}·${eg.group} (${eg.subs.length} options)`).join("  ·  ")}
+                  {electiveGroups.map(eg =>
+                    `${eg.ybKey}·${eg.group} (${eg.theorySubs.length} theory${eg.labSubs.length ? ` + ${eg.labSubs.length} lab` : ""})`
+                  ).join("  ·  ")}
                 </li>
               )}
               <li style={{ color: "#888" }}>
@@ -658,7 +679,7 @@ export default function LoadAllocationUploader({ onDataParsed }) {
             </ul>
           </div>
 
-          {/* Teachers table with load */}
+          {/* Teachers table */}
           <div style={S.sectionHdr}>👨‍🏫 Teachers ({parsed.teachers.length})</div>
           <div style={{ maxHeight: 260, overflowY: "auto" }}>
             <table style={S.table}>
@@ -698,9 +719,10 @@ export default function LoadAllocationUploader({ onDataParsed }) {
 
           {/* Per year-branch subject details */}
           {Object.entries(parsed.subjects).map(([ybKey, subs]) => {
-            const yb       = parsed.yearBranches.find(y => y.id === ybKey);
-            const regular  = subs.filter(s => !s.type.startsWith("Elective-"));
-            const elective = subs.filter(s =>  s.type.startsWith("Elective-"));
+            const yb             = parsed.yearBranches.find(y => y.id === ybKey);
+            const regular        = subs.filter(s => !s.type.startsWith("Elective-"));
+            const electiveTheory = subs.filter(s => /^Elective-/.test(s.type) && !/-Lab$/.test(s.type));
+            const electiveLabs   = subs.filter(s => /-Lab$/.test(s.type));
 
             return (
               <div key={ybKey}>
@@ -711,7 +733,6 @@ export default function LoadAllocationUploader({ onDataParsed }) {
                   </span>
                 </div>
 
-                {/* Regular subjects */}
                 {regular.length > 0 && (
                   <div style={{ maxHeight: 300, overflowY: "auto", marginBottom: 10 }}>
                     <table style={S.table}>
@@ -745,11 +766,10 @@ export default function LoadAllocationUploader({ onDataParsed }) {
                   </div>
                 )}
 
-                {/* Elective subjects grouped by DLO/MINOR */}
-                {elective.length > 0 && (
+                {electiveTheory.length > 0 && (
                   <>
                     <div style={{ fontSize: 12, fontWeight: 600, color: "#9c4221", marginBottom: 6 }}>
-                      🎓 Elective Subjects ({elective.length})
+                      🎓 Elective Theory Subjects ({electiveTheory.length})
                     </div>
                     <div style={{ maxHeight: 260, overflowY: "auto", marginBottom: 10 }}>
                       <table style={S.table}>
@@ -758,19 +778,52 @@ export default function LoadAllocationUploader({ onDataParsed }) {
                             <th style={S.th}>Subject</th>
                             <th style={S.th}>Group</th>
                             <th style={{ ...S.th, textAlign: "center" }}>Sessions/wk</th>
-                            <th style={{ ...S.th, textAlign: "center" }}>Lab hrs</th>
                             <th style={S.th}>Teacher</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {elective.map((sub, i) => {
+                          {electiveTheory.map((sub, i) => {
                             const tNames = allTeachersForSub(ybKey, sub.id);
                             return (
                               <tr key={i} style={{ background: i % 2 === 0 ? "#fffdf5" : "#fff" }}>
                                 <td style={{ ...S.td, fontWeight: 600 }}>{sub.name}</td>
                                 <td style={S.td}><span style={S.chip(sub.type)}>{sub.electiveGroup}</span></td>
                                 <td style={{ ...S.td, textAlign: "center", fontWeight: 700 }}>{sub.hours || "—"}</td>
-                                <td style={{ ...S.td, textAlign: "center", fontWeight: 700 }}>{sub.labHours > 0 ? sub.labHours : "—"}</td>
+                                <td style={{ ...S.td, fontSize: 11 }}>
+                                  {tNames.length ? tNames.join(", ") : <span style={{ color: "#bbb" }}>unassigned</span>}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
+
+                {electiveLabs.length > 0 && (
+                  <>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: "#3730a3", marginBottom: 6 }}>
+                      🔬 Elective Lab Subjects ({electiveLabs.length})
+                    </div>
+                    <div style={{ maxHeight: 260, overflowY: "auto", marginBottom: 10 }}>
+                      <table style={S.table}>
+                        <thead>
+                          <tr>
+                            <th style={S.th}>Subject</th>
+                            <th style={S.th}>Group</th>
+                            <th style={{ ...S.th, textAlign: "center" }}>Lab hrs</th>
+                            <th style={S.th}>Teacher</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {electiveLabs.map((sub, i) => {
+                            const tNames = allTeachersForSub(ybKey, sub.id);
+                            return (
+                              <tr key={i} style={{ background: i % 2 === 0 ? "#f5f5ff" : "#fff" }}>
+                                <td style={{ ...S.td, fontWeight: 600 }}>{sub.name}</td>
+                                <td style={S.td}><span style={S.chip(sub.type)}>{sub.electiveGroup} Lab</span></td>
+                                <td style={{ ...S.td, textAlign: "center", fontWeight: 700 }}>{sub.labHours || 2}</td>
                                 <td style={{ ...S.td, fontSize: 11 }}>
                                   {tNames.length ? tNames.join(", ") : <span style={{ color: "#bbb" }}>unassigned</span>}
                                 </td>
@@ -800,25 +853,38 @@ export default function LoadAllocationUploader({ onDataParsed }) {
                     <tbody>
                       {subs.map((sub, i) => {
                         const isLab      = sub.type.startsWith("Core Lab");
-                        const isElective = sub.type.startsWith("Elective-");
+                        const isElective = /^Elective-/.test(sub.type) && !/-Lab$/.test(sub.type);
+                        const isELab     = /-Lab$/.test(sub.type);
+                        const rowBg = isELab
+                          ? (i % 2 === 0 ? "#f5f5ff" : "#f0f0ff")
+                          : isElective
+                            ? (i % 2 === 0 ? "#fffdf5" : "#fffbf0")
+                            : isLab
+                              ? "#f0fff4"
+                              : (i % 2 === 0 ? "#fafbff" : "#fff");
                         return (
-                          <tr key={i} style={{
-                            background: isElective ? "#fffdf5" : isLab ? "#f0fff4" : (i % 2 === 0 ? "#fafbff" : "#fff"),
-                          }}>
+                          <tr key={i} style={{ background: rowBg }}>
                             <td style={{ ...S.td, fontWeight: 600 }}>
-                              {isElective && <span style={{ fontSize: 9, color: "#9c4221", fontWeight: 700, marginRight: 4 }}>[{sub.electiveGroup}]</span>}
+                              {(isElective || isELab) && (
+                                <span style={{ fontSize: 9, color: isELab ? "#3730a3" : "#9c4221", fontWeight: 700, marginRight: 4 }}>
+                                  [{sub.electiveGroup}{isELab ? " Lab" : ""}]
+                                </span>
+                              )}
                               {sub.name}
                             </td>
                             {(yb?.divs || []).map(div => {
                               const assign = parsed.assignments[ybKey]?.[div]?.[sub.id];
-                              const code   = assign?.teacherCode;
-                              const t      = code ? parsed.teachers.find(x => x.code === code) : null;
+                              const labels = assignmentLabel(assign, isLab);
                               return (
                                 <td key={div} style={S.td}>
-                                  {code
-                                    ? <span style={{ fontFamily: "monospace", fontWeight: 700, color: "#667eea" }}>
-                                        {code}{t ? ` — ${t.name}` : ""}
-                                      </span>
+                                  {labels?.length
+                                    ? <div style={{ display: "grid", gap: 4 }}>
+                                        {labels.map((label, idx) => (
+                                          <span key={idx} style={{ fontFamily: "monospace", fontWeight: 700, color: "#667eea", fontSize: 11 }}>
+                                            {label}
+                                          </span>
+                                        ))}
+                                      </div>
                                     : <span style={{ color: "#ccc" }}>—</span>}
                                 </td>
                               );

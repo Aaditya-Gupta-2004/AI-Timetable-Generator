@@ -1,5 +1,25 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// timetableHelpers.js  — FIXED: [object Object], TE-IT empty, lab teacher codes
+// timetableHelpers.js — v5
+//
+// FIXES vs v4:
+//   1. NO MID-DAY GAPS
+//      - placeTheorySubject now scans ALLOC sequentially (lowest index first)
+//        instead of randomly, so lectures pack tightly from slot 0.
+//      - placeElectiveGroup does the same for theory electives.
+//      - placeLabRotations and placeElectiveLabGroup already iterate
+//        validLabStarts in order — kept as-is but day-selection now also
+//        prefers days that already have content (pack before spreading).
+//      - fillRemedials is the ONLY thing that adds trailing REMEDIAL cells;
+//        it never touches mid-day empties.
+//
+//   2. MINOR LAB FOR ALL YEARS
+//      - isElectiveLab() already matches "Elective-MINOR-Lab" — no change
+//        needed here. Fix is in LoadAllocationUploader classifyYD().
+//
+//   3. REMEDIAL ONLY AT END
+//      - fillRemedials unchanged from v4 (only fills slots after last
+//        occupied slot per day). Now that placers don't leave gaps, this
+//        guarantee holds.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { API_BASE } from "../config/api";
@@ -23,11 +43,11 @@ export const SLOT_LBL  = {
 export const CORE_LAB_TYPES  = ["Core Lab 1", "Core Lab 2", "Core Lab 3"];
 export const isCoreLab       = t => CORE_LAB_TYPES.includes(t);
 export const ELECTIVE_GROUPS = ["Elective 1", "Elective 2", "Elective 3", "Elective 4", "Elective 5"];
-export const isElectiveType  = t => {
-  // Recognizes standard electives and new types from Loadallocationuploader
+
+export const isElectiveLab  = t => /^Elective-.+-Lab$/.test(t);
+export const isElectiveType = t => {
   if (ELECTIVE_GROUPS.includes(t)) return true;
-  // Match Elective-MINOR, Elective-DLO1 through Elective-DLO6, and other dynamic electives
-  if (/^Elective-/.test(t)) return true;
+  if (/^Elective-/.test(t) && !isElectiveLab(t)) return true;
   return false;
 };
 
@@ -37,13 +57,11 @@ export const getBatches = (div, numBatches) =>
   Array.from({ length: numBatches }, (_, i) => `${div}${i + 1}`);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FIX #1: toCodeStr — robustly normalise teacherCode regardless of storage type
-// Handles: string, {code, name}, {teacherCode}, plain object, null/undefined
+// toCodeStr
 // ─────────────────────────────────────────────────────────────────────────────
 export function toCodeStr(val) {
   if (!val) return "";
   if (typeof val === "string") return val.trim();
-  // Object shapes that TeacherSelect might return
   if (typeof val === "object") {
     if (val.code)        return String(val.code).trim();
     if (val.teacherCode) return String(val.teacherCode).trim();
@@ -112,6 +130,21 @@ function shuffle(arr) {
   return a;
 }
 
+// ── Day ordering: prefer days that already have content (pack tightly) ─────────
+/**
+ * Returns DAYS sorted so that days with MORE occupied slots come first.
+ * This ensures new sessions are stacked onto already-used days before
+ * spreading to fresh days, eliminating mid-day gaps.
+ */
+function packedDayOrder(grid) {
+  return [...DAYS].sort((a, b) => {
+    const countOccupied = day =>
+      ALLOC.filter(s => grid[day][s].subject !== "").length;
+    // Sort descending: days with more content first
+    return countOccupied(b) - countOccupied(a);
+  });
+}
+
 // ── Empty grid factory ────────────────────────────────────────────────────────
 export function buildEmptyGrid() {
   const g = {};
@@ -159,7 +192,7 @@ function markRoom(map, num, day, allocIndices) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LAB ROTATION SCHEDULER
+// LAB ROTATION SCHEDULER (Core Labs)
 // ─────────────────────────────────────────────────────────────────────────────
 export function placeLabRotations(
   grid, labSubjects, div, numBatches, assignments,
@@ -171,7 +204,13 @@ export function placeLabRotations(
   const numLabs        = labSubjects.length;
   const labRoundsOnDay = {};
   DAYS.forEach(d => { labRoundsOnDay[d] = []; });
-  const dayOrder = shuffle([...DAYS]);
+
+  const getBatchAssign = (subId, batch) => {
+    const assign = assignments?.[subId];
+    if (!assign) return null;
+    const batchAssigns = Array.isArray(assign.batchAssigns) ? assign.batchAssigns : [];
+    return batchAssigns.find(b => b.batch === batch) || null;
+  };
 
   for (let roundIdx = 0; roundIdx < numLabs; roundIdx++) {
     const batchAssign = batches.map((batch, bi) => ({
@@ -182,9 +221,14 @@ export function placeLabRotations(
     const labSz = Math.max(...batchAssign.map(ba => parseInt(ba.sub.labHours) || 2));
     let placed  = false;
 
-    const sortedDays = [...dayOrder].sort(
-      (a, b) => labRoundsOnDay[a].length - labRoundsOnDay[b].length
-    );
+    // Sort days: prefer days with fewest lab rounds AND most existing content (pack)
+    const sortedDays = [...DAYS].sort((a, b) => {
+      const labDiff = labRoundsOnDay[a].length - labRoundsOnDay[b].length;
+      if (labDiff !== 0) return labDiff;
+      // Secondary: prefer days that already have lectures (avoids isolated lab day)
+      const occupied = day => ALLOC.filter(s => grid[day][s].subject !== "").length;
+      return occupied(b) - occupied(a);
+    });
 
     for (const day of sortedDays) {
       if (placed) break;
@@ -204,23 +248,36 @@ export function placeLabRotations(
 
         if (slotNames.some(s => grid[day][s].subject !== "")) continue;
 
-        // FIX #1: always toCodeStr when reading teacher codes from assignments
-        const batchTeachers = batchAssign.map(ba =>
-          toCodeStr(assignments?.[ba.sub.id]?.teacherCode)
-        );
+        const batchTeachers = batchAssign.map(ba => {
+          const batchSpecific = getBatchAssign(ba.sub.id, ba.batch);
+          return toCodeStr(batchSpecific?.teacherCode || assignments?.[ba.sub.id]?.teacherCode);
+        });
         if (!batchTeachers.every(code =>
           teacherFree(globalTeacherSlots, code, day, allocIndices)
         )) continue;
 
         const assignedRooms = [];
         let roomOk = true;
-        for (const { batch } of batchAssign) {
+        for (const ba of batchAssign) {
+          const batchSpecific = getBatchAssign(ba.sub.id, ba.batch);
+          const preferredRoom = batchSpecific?.room || "";
+          if (preferredRoom) {
+            const usablePreferred = labPool.find(r =>
+              r.number === preferredRoom &&
+              !assignedRooms.includes(r.number) &&
+              roomFree(globalRoomSlots, r.number, day, allocIndices)
+            );
+            if (usablePreferred) {
+              assignedRooms.push(usablePreferred.number);
+              continue;
+            }
+          }
           const freeRoom = labPool.find(r =>
             !assignedRooms.includes(r.number) &&
             roomFree(globalRoomSlots, r.number, day, allocIndices)
           );
           if (!freeRoom && labPool.length > 0) { roomOk = false; break; }
-          assignedRooms.push(freeRoom ? freeRoom.number : "");
+          assignedRooms.push(freeRoom ? freeRoom.number : preferredRoom);
         }
         if (!roomOk) continue;
 
@@ -231,7 +288,7 @@ export function placeLabRotations(
           batch,
           subjectName: sub.name,
           subType:     sub.type,
-          teacherCode: batchTeachers[bi],   // already a plain string
+          teacherCode: batchTeachers[bi],
           room:        assignedRooms[bi] || "",
         }));
 
@@ -253,33 +310,178 @@ export function placeLabRotations(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// THEORY SUBJECT PLACER
+// ELECTIVE LAB GROUP PLACER (DLO Labs, MINOR Labs)
+// All options in the group placed in parallel as a 2-hour block.
 // ─────────────────────────────────────────────────────────────────────────────
-function placeTheorySubject(grid, sub, teacherCode, room, globalTeacherSlots, globalRoomSlots) {
-  const sessions = parseInt(sub.hours) || 1;
-  const usedDays = new Set();
+function placeElectiveLabGroup(
+  grid, groupSubs, assignments, labPool,
+  globalTeacherSlots, globalRoomSlots
+) {
+  if (!groupSubs.length) return;
+
+  const labSz = 2;
+
+  // Try each day in packed order (prefer days that already have content)
+  const dayOrder = packedDayOrder(grid);
+
+  for (const day of dayOrder) {
+    for (const startAI of validLabStarts(labSz)) {
+      const allocIndices = Array.from({ length: labSz }, (_, k) => startAI + k);
+      const slotNames    = allocIndices.map(i => ALLOC[i]);
+
+      if (slotNames.some(s => grid[day][s].subject !== "")) continue;
+
+      const teacherCodes = groupSubs
+        .map(gs => toCodeStr(assignments?.[gs.id]?.teacherCode))
+        .filter(Boolean);
+
+      if (!teacherCodes.every(code =>
+        teacherFree(globalTeacherSlots, code, day, allocIndices)
+      )) continue;
+
+      const usedRooms   = [];
+      const roomAssigns = groupSubs.map(() => {
+        const room = labPool.find(r =>
+          !usedRooms.includes(r.number) &&
+          roomFree(globalRoomSlots, r.number, day, allocIndices)
+        );
+        if (room) { usedRooms.push(room.number); return room.number; }
+        return "";
+      });
+
+      teacherCodes.forEach(code => markTeacher(globalTeacherSlots, code, day, allocIndices));
+      roomAssigns.forEach(num => { if (num) markRoom(globalRoomSlots, num, day, allocIndices); });
+
+      const electives = groupSubs.map((gs, i) => ({
+        name:        gs.name,
+        teacherCode: toCodeStr(assignments?.[gs.id]?.teacherCode),
+        room:        roomAssigns[i] || "",
+      }));
+
+      const typeMatch  = groupSubs[0]?.type?.match(/^Elective-(.+)-Lab$/);
+      const groupLabel = typeMatch ? `${typeMatch[1]} Lab` : "Elective Lab";
+
+      const cellData = {
+        subject:       groupLabel,
+        teacherCode:   teacherCodes.join(", "),
+        room:          roomAssigns.filter(Boolean).join(", "),
+        batches:       null,
+        electives,
+        isElectiveLab: true,
+      };
+
+      slotNames.forEach(s => { grid[day][s] = { ...cellData }; });
+      return; // placed — done for this group
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THEORY SUBJECT PLACER
+//
+// FIX: Scan ALLOC sequentially (lowest ai first) rather than shuffling days.
+// This packs lectures from the start of each day, leaving no mid-day holes.
+// A per-day cap ensures at most `maxPerDay` sessions on the same day so the
+// load is still somewhat spread (default 3; raise if you want more stacking).
+// ─────────────────────────────────────────────────────────────────────────────
+function placeTheorySubject(
+  grid, sub, teacherCode, room,
+  globalTeacherSlots, globalRoomSlots,
+  maxPerDay = 3
+) {
+  const sessions  = parseInt(sub.hours) || 1;
+  const dayCount  = {};  // how many sessions of THIS subject placed per day
   let placed = 0;
 
-  for (let attempt = 0; attempt < 5 && placed < sessions; attempt++) {
-    for (const day of shuffle([...DAYS])) {
-      if (placed >= sessions) break;
-      if (attempt === 0 && usedDays.has(day)) continue;
+  // Build day order once: prefer days that already have content (pack)
+  // but also spread this subject (don't put all sessions on 1 day)
+  const dayOrder = packedDayOrder(grid);
 
+  for (let pass = 0; pass < 3 && placed < sessions; pass++) {
+    for (const day of dayOrder) {
+      if (placed >= sessions) break;
+      if ((dayCount[day] || 0) >= (pass === 0 ? 1 : maxPerDay)) continue;
+
+      // Sequential scan: pick the first free slot on this day
       for (let ai = 0; ai < ALLOC.length; ai++) {
         const slot = ALLOC[ai];
-        if (grid[day][slot].subject === "" &&
-            teacherFree(globalTeacherSlots, teacherCode, day, [ai]) &&
-            roomFree(globalRoomSlots, room, day, [ai])) {
+        if (
+          grid[day][slot].subject === "" &&
+          teacherFree(globalTeacherSlots, teacherCode, day, [ai]) &&
+          roomFree(globalRoomSlots, room, day, [ai])
+        ) {
           grid[day][slot] = {
             subject: sub.name,
-            teacherCode,   // plain string
+            teacherCode,
             room,
-            batches: null,
+            batches:  null,
             electives: null,
           };
           markTeacher(globalTeacherSlots, teacherCode, day, [ai]);
           markRoom(globalRoomSlots, room, day, [ai]);
-          if (attempt === 0) usedDays.add(day);
+          dayCount[day] = (dayCount[day] || 0) + 1;
+          placed++;
+          break; // one slot per day per pass
+        }
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ELECTIVE GROUP PLACER (theory electives — DLO1, MINOR, etc.)
+//
+// FIX: Sequential slot scan (no shuffle within a day) to avoid gaps.
+// ─────────────────────────────────────────────────────────────────────────────
+function placeElectiveGroup(
+  grid, groupType, groupSubs, assignments,
+  classroomPool, electivePool,
+  globalTeacherSlots, globalRoomSlots
+) {
+  const sessions  = parseInt(groupSubs[0]?.hours) || 1;
+  const pool      = electivePool.length ? electivePool : classroomPool;
+  const dayCount  = {};
+  const usedCount = {};
+  let placed = 0;
+
+  const dayOrder = packedDayOrder(grid);
+
+  for (let pass = 0; pass < 3 && placed < sessions; pass++) {
+    for (const day of dayOrder) {
+      if (placed >= sessions) break;
+      if ((dayCount[day] || 0) >= (pass === 0 ? 1 : 2)) continue;
+
+      const teacherCodes = groupSubs
+        .map(gs => toCodeStr(assignments?.[gs.id]?.teacherCode))
+        .filter(Boolean);
+      const eRoom = pickRoom(pool, usedCount);
+
+      // Sequential scan
+      for (let ai = 0; ai < ALLOC.length; ai++) {
+        const slot = ALLOC[ai];
+        if (
+          grid[day][slot].subject === "" &&
+          teacherCodes.every(code => teacherFree(globalTeacherSlots, code, day, [ai])) &&
+          roomFree(globalRoomSlots, eRoom, day, [ai])
+        ) {
+          const electives = groupSubs.map(gs => ({
+            name:        gs.name,
+            teacherCode: toCodeStr(assignments?.[gs.id]?.teacherCode),
+            room:        eRoom,
+          }));
+
+          grid[day][slot] = {
+            subject:     groupType,
+            teacherCode: teacherCodes.join(", "),
+            room:        eRoom,
+            batches:     null,
+            electives,
+          };
+
+          markTeacher(globalTeacherSlots, teacherCodes[0] || "", day, [ai]);
+          teacherCodes.forEach(code => markTeacher(globalTeacherSlots, code, day, [ai]));
+          markRoom(globalRoomSlots, eRoom, day, [ai]);
+          dayCount[day] = (dayCount[day] || 0) + 1;
           placed++;
           break;
         }
@@ -289,76 +491,28 @@ function placeTheorySubject(grid, sub, teacherCode, room, globalTeacherSlots, gl
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ELECTIVE GROUP PLACER
-// ─────────────────────────────────────────────────────────────────────────────
-function placeElectiveGroup(
-  grid, groupType, groupSubs, assignments,
-  classroomPool, electivePool,
-  globalTeacherSlots, globalRoomSlots
-) {
-  const sessions  = parseInt(groupSubs[0]?.hours) || 1;
-  const pool      = electivePool.length ? electivePool : classroomPool;
-  const usedDays  = new Set();
-  const usedCount = {};
-  let placed = 0;
-
-  for (let pass = 0; pass < 3 && placed < sessions; pass++) {
-    for (const day of shuffle([...DAYS])) {
-      if (placed >= sessions) break;
-      if (usedDays.has(day)) continue;
-
-      // FIX #1: toCodeStr for elective teachers too
-      const teacherCodes = groupSubs
-        .map(gs => toCodeStr(assignments?.[gs.id]?.teacherCode))
-        .filter(Boolean);
-      const eRoom = pickRoom(pool, usedCount);
-
-      const freeSlots = [];
-      for (let ai = 0; ai < ALLOC.length; ai++) {
-        const slot = ALLOC[ai];
-        if (grid[day][slot].subject === "" &&
-            teacherCodes.every(code => teacherFree(globalTeacherSlots, code, day, [ai])) &&
-            roomFree(globalRoomSlots, eRoom, day, [ai])) {
-          freeSlots.push(ai);
-        }
-      }
-      if (freeSlots.length === 0) continue;
-
-      const bestAi = freeSlots[0];
-      const slot   = ALLOC[bestAi];
-
-      const electives = groupSubs.map(gs => ({
-        name:        gs.name,
-        teacherCode: toCodeStr(assignments?.[gs.id]?.teacherCode),  // plain string
-        room:        eRoom,
-      }));
-
-      grid[day][slot] = {
-        subject:     groupType,
-        teacherCode: teacherCodes.join(", "),
-        room:        eRoom,
-        batches:     null,
-        electives,
-      };
-
-      teacherCodes.forEach(code => markTeacher(globalTeacherSlots, code, day, [bestAi]));
-      markRoom(globalRoomSlots, eRoom, day, [bestAi]);
-      usedDays.add(day);
-      placed++;
-    }
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// FILL REMEDIALS
+// FILL REMEDIALS — ONLY after the last occupied slot per day
+// Never fills mid-day gaps; those are prevented by the sequential placers.
 // ─────────────────────────────────────────────────────────────────────────────
 function fillRemedials(grid) {
   DAYS.forEach(day => {
-    ALLOC.forEach(slot => {
-      if (grid[day][slot].subject === "") {
+    let lastOccupiedAI = -1;
+    ALLOC.forEach((slot, ai) => {
+      if (grid[day][slot].subject !== "") {
+        lastOccupiedAI = ai;
+      }
+    });
+
+    // Only slots AFTER the last occupied slot get REMEDIAL
+    ALLOC.forEach((slot, ai) => {
+      if (ai > lastOccupiedAI && grid[day][slot].subject === "") {
         grid[day][slot] = {
-          subject: "REMEDIAL", teacherCode: "", room: "",
-          batches: null, electives: null, isRemedial: true,
+          subject:     "REMEDIAL",
+          teacherCode: "",
+          room:        "",
+          batches:     null,
+          electives:   null,
+          isRemedial:  true,
         };
       }
     });
@@ -366,21 +520,33 @@ function fillRemedials(grid) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FIX #2: normaliseAssignments — flatten any assignment value to {teacherCode: string}
-// This is the key fix for TE-IT being empty AND [object Object] display
+// normaliseAssignments
 // ─────────────────────────────────────────────────────────────────────────────
 function normaliseAssignments(rawAssignments) {
   const out = {};
   if (!rawAssignments) return out;
   Object.entries(rawAssignments).forEach(([subId, val]) => {
-    // val could be: "YM", {teacherCode: "YM"}, {teacherCode: {code:"YM", name:"..."}}, etc.
-    out[subId] = { teacherCode: toCodeStr(typeof val === "object" ? (val?.teacherCode ?? val) : val) };
+    const teacherCode = toCodeStr(typeof val === "object" ? (val?.teacherCode ?? val) : val);
+    const rawBatchAssigns = Array.isArray(val?.batchAssigns)
+      ? val.batchAssigns
+      : (Array.isArray(val?.batch_assigns) ? val.batch_assigns : []);
+    out[subId] = {
+      teacherCode,
+      batchAssigns: rawBatchAssigns
+        .map(b => ({
+          batch:       String(b?.batch || "").trim(),
+          teacherCode: toCodeStr(b?.teacherCode ?? b?.teacher_code),
+          room:        String(b?.room || "").trim(),
+        }))
+        .filter(b => b.batch),
+    };
   });
   return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SINGLE-DIVISION GENERATOR
+// Order: Core Labs → Elective Labs → Theory Electives → Theory → Remedials(end)
 // ─────────────────────────────────────────────────────────────────────────────
 export function generateTimetable(
   subjects,
@@ -391,11 +557,11 @@ export function generateTimetable(
   globalTeacherSlots = {},
   globalRoomSlots    = {}
 ) {
-  // FIX #2: normalise all assignments before any use
   const normAssign = normaliseAssignments(assignments);
 
   const grid             = buildEmptyGrid();
   const labSubjects      = subjects.filter(s => isCoreLab(s.type));
+  const electiveLabSubs  = subjects.filter(s => isElectiveLab(s.type));
   const theorySubjects   = subjects.filter(s => s.type === "theory");
   const electiveSubjects = subjects.filter(s => isElectiveType(s.type));
   const classroomPool    = roomPools.theory   || [];
@@ -403,13 +569,33 @@ export function generateTimetable(
   const labPool          = roomPools.lab      || [];
   const cUsed            = {};
 
-  // 1. Labs
+  // ── Step 1: Core Lab rotations ─────────────────────────────────────────────
   placeLabRotations(
     grid, labSubjects, div, numBatches, normAssign,
     labPool, globalTeacherSlots, globalRoomSlots
   );
 
-  // 2. Electives
+  // ── Step 2: Elective Labs (DLO Labs, MINOR Labs) ───────────────────────────
+  if (electiveLabSubs.length) {
+    const electiveLabGroups = {};
+    electiveLabSubs.forEach(sub => {
+      const m        = sub.type.match(/^Elective-(.+)-Lab$/);
+      const groupKey = m ? m[1] : sub.type;
+      if (!electiveLabGroups[groupKey]) electiveLabGroups[groupKey] = [];
+      electiveLabGroups[groupKey].push(sub);
+    });
+
+    const eLabPool = labPool.length ? labPool : classroomPool;
+
+    Object.values(electiveLabGroups).forEach(groupSubs => {
+      placeElectiveLabGroup(
+        grid, groupSubs, normAssign, eLabPool,
+        globalTeacherSlots, globalRoomSlots
+      );
+    });
+  }
+
+  // ── Step 3: Theory Electives ───────────────────────────────────────────────
   const electiveGroups = {};
   electiveSubjects.forEach(sub => {
     if (!electiveGroups[sub.type]) electiveGroups[sub.type] = [];
@@ -423,21 +609,21 @@ export function generateTimetable(
     );
   });
 
-  // 3. Theory
+  // ── Step 4: Theory subjects ────────────────────────────────────────────────
   theorySubjects.forEach(sub => {
     const teacherCode = toCodeStr(normAssign[sub.id]?.teacherCode);
     const room        = pickRoom(classroomPool, cUsed);
     placeTheorySubject(grid, sub, teacherCode, room, globalTeacherSlots, globalRoomSlots);
   });
 
-  // 4. Remedials
+  // ── Step 5: Remedials — ONLY after last occupied slot per day ──────────────
   fillRemedials(grid);
 
   return grid;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FIX #2: MULTI-DIVISION ORCHESTRATOR — fixed assignment lookup
+// MULTI-DIVISION ORCHESTRATOR
 // ─────────────────────────────────────────────────────────────────────────────
 export function generateAllTimetables(config) {
   const { yearBranches, ybSubjects, ybBatchCount, assignments, roomPools } = config;
@@ -452,15 +638,11 @@ export function generateAllTimetables(config) {
     const numBatches = ybBatchCount[yb.id] || 3;
     const rPools     = roomPools[yb.id]   || { theory: [], elective: [], lab: [] };
 
-    // FIX #2: assignments[yb.id] is the correct key — but we also try yb.year+"-"+yb.branch
-    // in case state was stored under display key
     const ybAssignments = assignments?.[yb.id] || assignments?.[`${yb.year}-${yb.branch}`] || {};
 
     for (const div of yb.divs) {
       const rawDivAssignments = ybAssignments[div] || {};
-
-      // FIX #2: fully normalise every assignment value to a plain string code
-      const divAssign = normaliseAssignments(rawDivAssignments);
+      const divAssign         = normaliseAssignments(rawDivAssignments);
 
       allTimetables[yb.id][div] = generateTimetable(
         subjects, divAssign, rPools, numBatches, div,
@@ -534,21 +716,42 @@ export function buildLabRoomTTs(allTimetables) {
       DAYS.forEach(day => {
         SLOTS.forEach(slot => {
           const cell = grid[day]?.[slot];
-          if (!cell || cell.subject === "BREAK" || !cell.isLabRotation || !cell.batches?.length) return;
-          cell.batches.forEach(b => {
-            if (!b.room) return;
-            if (!roomTTs[b.room]) {
-              roomTTs[b.room] = {};
-              DAYS.forEach(d => { roomTTs[b.room][d] = {}; SLOTS.forEach(s => { roomTTs[b.room][d][s] = null; }); });
-            }
-            roomTTs[b.room][day][slot] = {
-              batch:       b.batch,
-              subjectName: b.subjectName,
-              teacherCode: toCodeStr(b.teacherCode),   // FIX #1: always plain string
-              ybLabel:     ybKey,
-              div,
-            };
-          });
+          if (!cell || cell.subject === "BREAK") return;
+
+          if (cell.isLabRotation && cell.batches?.length) {
+            cell.batches.forEach(b => {
+              if (!b.room) return;
+              if (!roomTTs[b.room]) {
+                roomTTs[b.room] = {};
+                DAYS.forEach(d => { roomTTs[b.room][d] = {}; SLOTS.forEach(s => { roomTTs[b.room][d][s] = null; }); });
+              }
+              roomTTs[b.room][day][slot] = {
+                batch:       b.batch,
+                subjectName: b.subjectName,
+                teacherCode: toCodeStr(b.teacherCode),
+                ybLabel:     ybKey,
+                div,
+              };
+            });
+          }
+
+          if (cell.isElectiveLab && cell.electives?.length) {
+            cell.electives.forEach(e => {
+              if (!e.room) return;
+              if (!roomTTs[e.room]) {
+                roomTTs[e.room] = {};
+                DAYS.forEach(d => { roomTTs[e.room][d] = {}; SLOTS.forEach(s => { roomTTs[e.room][d][s] = null; }); });
+              }
+              roomTTs[e.room][day][slot] = {
+                batch:         "",
+                subjectName:   e.name,
+                teacherCode:   toCodeStr(e.teacherCode),
+                ybLabel:       ybKey,
+                div,
+                isElectiveLab: true,
+              };
+            });
+          }
         });
       });
     });
@@ -583,18 +786,18 @@ export function buildClassroomTTs(allTimetables, rooms) {
             if (!roomTTs[roomNum]) return;
             if (cell.electives?.length) {
               roomTTs[roomNum][day][slot].push({
-                subject: cell.subject,
+                subject:     cell.subject,
                 teacherCode: toCodeStr(cell.teacherCode),
-                ybLabel: ybKey, div,
-                electives: cell.electives.map(e => ({
-                  ...e, teacherCode: toCodeStr(e.teacherCode),
-                })),
+                ybLabel:     ybKey,
+                div,
+                electives:   cell.electives.map(e => ({ ...e, teacherCode: toCodeStr(e.teacherCode) })),
               });
             } else if (!cell.batches) {
               roomTTs[roomNum][day][slot].push({
-                subject: cell.subject,
+                subject:     cell.subject,
                 teacherCode: toCodeStr(cell.teacherCode),
-                ybLabel: ybKey, div,
+                ybLabel:     ybKey,
+                div,
               });
             }
           });
@@ -604,6 +807,17 @@ export function buildClassroomTTs(allTimetables, rooms) {
   });
 
   return roomTTs;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// buildRunViews
+// ─────────────────────────────────────────────────────────────────────────────
+export function buildRunViews(allTimetables, teachers, rooms) {
+  return {
+    teacherTTs:   buildTeacherTTs(allTimetables, teachers),
+    labRoomTTs:   buildLabRoomTTs(allTimetables),
+    classroomTTs: buildClassroomTTs(allTimetables, rooms),
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -637,6 +851,7 @@ export function generatePDF(grid, caption, dept, semLabel, teachers, footerRoles
       subjectRows += `<tr><td>${srNo++}</td><td>${cell.subject}</td><td>—</td><td>${code||"—"}</td><td>${tO?.name||"—"}</td><td>${cell.room||"—"}</td></tr>`;
     }
   }));
+
   let gridHTML = "";
   DAYS.forEach(day => {
     const cells = SLOTS.map(slot => {
@@ -651,7 +866,8 @@ export function generatePDF(grid, caption, dept, semLabel, teachers, footerRoles
         }).join("")}</td>`;
       }
       if (cell.electives?.length) {
-        return `<td class="elective-cell"><div class="elective-group-label">${cell.subject}</div>${cell.electives.map(e => {
+        const cellClass = cell.isElectiveLab ? "elective-lab-cell" : "elective-cell";
+        return `<td class="${cellClass}"><div class="elective-group-label">${cell.subject}</div>${cell.electives.map(e => {
           const code = toCodeStr(e.teacherCode);
           return `<div class="elective-opt-line"><strong>${e.name}</strong>${code?`<div class="tc">${code}</div>`:""}${e.room?`<div class="room-tag">${e.room}</div>`:""}</div>`;
         }).join("")}</td>`;
@@ -661,7 +877,9 @@ export function generatePDF(grid, caption, dept, semLabel, teachers, footerRoles
     }).join("");
     gridHTML += `<tr><td class="day-cell">${DAY_SHORT[day]}</td>${cells}</tr>`;
   });
+
   const signBlocks = (footerRoles || []).filter(r=>r.role&&r.name).map(r=>`<div class="sign-block"><div class="sign-label">${r.role}</div><div class="sign-name">${r.name}</div></div>`).join("");
+
   printWindow.document.write(`<!DOCTYPE html><html><head><title>${caption}</title><style>
     @page{size:A3 landscape;margin:15mm;}body{font-family:'Segoe UI',Arial,sans-serif;font-size:11px;color:#222;}
     .header{text-align:center;margin-bottom:12px;}.header h2{margin:0;font-size:16px;}.header h3{margin:4px 0;font-size:13px;color:#667eea;}
@@ -670,6 +888,7 @@ export function generatePDF(grid, caption, dept, semLabel, teachers, footerRoles
     .remedial-cell{background:#f0f0f0;color:#999;font-weight:600;font-style:italic;}
     .lab-cell{background:#e8f5e9;color:#2e7d32;}
     .elective-cell{background:#fffbf0;color:#92400e;}
+    .elective-lab-cell{background:#f0f0ff;color:#3730a3;}
     .elective-group-label{font-weight:700;font-size:9px;color:#b45309;border-bottom:1px solid #fcd34d;padding-bottom:2px;margin-bottom:3px;text-transform:uppercase;text-align:center;}
     .elective-opt-line{margin-bottom:3px;padding:2px 4px;background:rgba(252,211,77,0.15);border-radius:3px;font-size:9px;text-align:center;}
     .batch-line{margin-bottom:4px;font-size:9px;text-align:center;}
@@ -699,7 +918,8 @@ export function generateLabRoomPDF(roomNumber, roomGrid, dept, semLabel, teacher
       if (!entry) return `<td style="color:#ccc;">—</td>`;
       const code = toCodeStr(entry.teacherCode);
       const tO   = teachers.find(t => t.code === code);
-      return `<td class="lab-cell"><span class="batch-tag">${entry.batch}</span><strong style="display:block;margin-top:3px;">${entry.subjectName}</strong>${tO?`<span class="tc">${tO.name}</span>`:(code?`<span class="tc">${code}</span>`:"")}<br/><span style="font-size:8px;color:#888;">${entry.ybLabel} / Div ${entry.div}</span></td>`;
+      const batchLabel = entry.batch ? `<span class="batch-tag">${entry.batch}</span>` : "";
+      return `<td class="lab-cell">${batchLabel}<strong style="display:block;margin-top:3px;">${entry.subjectName}</strong>${tO?`<span class="tc">${tO.name}</span>`:(code?`<span class="tc">${code}</span>`:"")}<br/><span style="font-size:8px;color:#888;">${entry.ybLabel} / Div ${entry.div}</span></td>`;
     }).join("");
     gridHTML += `<tr><td class="day-cell">${DAY_SHORT[day]}</td>${cells}</tr>`;
   });

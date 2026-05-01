@@ -3,7 +3,7 @@ import Layout from "./Layout";
 import * as XLSX from "xlsx";
 
 import {
-  uid, norm, isCoreLab,
+  uid, norm, isCoreLab, getBatches,
   apiGet, apiPost,
   generateAllTimetables,        // ✅ FIX: use generateAllTimetables instead of generateTimetable
   buildTeacherTTs, buildLabRoomTTs,
@@ -51,6 +51,14 @@ export default function GenerateTimetable() {
   const [ybSubjects,    setYbSubjects]    = useState({});
   const [activeSubYbId, setActiveSubYbId] = useState("");
   const getYbSubs = id => ybSubjects[id] || [];
+  const normaliseBatchAssigns = (batchAssigns = []) =>
+    (Array.isArray(batchAssigns) ? batchAssigns : [])
+      .map(b => ({
+        batch: String(b?.batch || "").trim(),
+        teacherCode: String(b?.teacherCode || b?.teacher_code || "").trim(),
+        room: String(b?.room || "").trim(),
+      }))
+      .filter(b => b.batch);
 
   // ── Rooms ─────────────────────────────────────────────────────────────────
   const [rooms,          setRooms]          = useState([]);
@@ -209,7 +217,12 @@ export default function GenerateTimetable() {
             if (!newAssignments[yb.id][div]) newAssignments[yb.id][div] = {};
             Object.entries(subMap2).forEach(([subName, assignVal]) => {
               const subObj = ybSubs.find(s => s.name === subName);
-              if (subObj) newAssignments[yb.id][div][subObj.id] = { teacherCode: assignVal.teacher_code || "" };
+              if (subObj) {
+                newAssignments[yb.id][div][subObj.id] = {
+                  teacherCode: assignVal.teacher_code || "",
+                  batchAssigns: normaliseBatchAssigns(assignVal.batch_assigns),
+                };
+              }
             });
           });
         } catch {}
@@ -242,7 +255,17 @@ export default function GenerateTimetable() {
     // 3. Batch counts
     const newBatchCount = { ...ybBatchCount };
     newYearBranches.forEach(yb => {
-      if (!newBatchCount[yb.id]) newBatchCount[yb.id] = 3;
+      let inferredCount = 0;
+      const parsedDivMap = parsedData.assignments?.[yb.id] || {};
+      Object.values(parsedDivMap).forEach(subAssignMap => {
+        Object.values(subAssignMap || {}).forEach(assignVal => {
+          normaliseBatchAssigns(assignVal?.batchAssigns).forEach(b => {
+            const m = b.batch.match(/(\d+)$/);
+            if (m) inferredCount = Math.max(inferredCount, parseInt(m[1], 10) || 0);
+          });
+        });
+      });
+      newBatchCount[yb.id] = inferredCount || newBatchCount[yb.id] || 3;
     });
     setYbBatchCount(newBatchCount);
 
@@ -278,8 +301,12 @@ export default function GenerateTimetable() {
         newAssignments[ybKey][div] = {};
         Object.entries(subAssignMap).forEach(([parsedSubId, assignVal]) => {
           const newLocalId = idBridge[parsedSubId];
-          if (newLocalId && assignVal?.teacherCode) {
-            newAssignments[ybKey][div][newLocalId] = { teacherCode: assignVal.teacherCode };
+          const batchAssigns = normaliseBatchAssigns(assignVal?.batchAssigns);
+          if (newLocalId && (assignVal?.teacherCode || batchAssigns.length)) {
+            newAssignments[ybKey][div][newLocalId] = {
+              teacherCode: assignVal?.teacherCode || "",
+              batchAssigns,
+            };
           }
         });
       });
@@ -490,6 +517,34 @@ export default function GenerateTimetable() {
       },
     }));
 
+  const setLabBatchTeacher = (ybId, div, subId, batch, teacherCode) =>
+    setAssignments(p => {
+      const current = p?.[ybId]?.[div]?.[subId] || {};
+      const existing = normaliseBatchAssigns(current.batchAssigns);
+      const batchSet = new Set(getBatches(div, getNumBatches(ybId)));
+      const nextBatchAssigns = [
+        ...existing.filter(b => b.batch !== batch && batchSet.has(b.batch) && (b.teacherCode || b.room)),
+        ...(teacherCode ? [{ batch, teacherCode, room: "" }] : []),
+      ].sort((a, b) => a.batch.localeCompare(b.batch, undefined, { numeric: true }));
+
+      const uniqueCodes = [...new Set(nextBatchAssigns.map(b => b.teacherCode).filter(Boolean))];
+
+      return {
+        ...p,
+        [ybId]: {
+          ...p[ybId],
+          [div]: {
+            ...(p[ybId]?.[div] || {}),
+            [subId]: {
+              ...current,
+              teacherCode: uniqueCodes.length === 1 && nextBatchAssigns.length === batchSet.size ? uniqueCodes[0] : "",
+              batchAssigns: nextBatchAssigns,
+            },
+          },
+        },
+      };
+    });
+
   const setDivCounsellor = (ybId, div, teacherCode) =>
     setDivCounsellors(p => ({ ...p, [ybId]: { ...(p[ybId] || {}), [div]: teacherCode } }));
 
@@ -548,7 +603,14 @@ export default function GenerateTimetable() {
           divA[div] = {};
           ybSubs.forEach(sub => {
             const a = assignments?.[yb.id]?.[div]?.[sub.id];
-            divA[div][sub.name] = { teacher_code: a?.teacherCode || "", room: "" };
+            const batchAssigns = normaliseBatchAssigns(a?.batchAssigns).map(b => ({
+              batch: b.batch, teacher_code: b.teacherCode, room: b.room || "",
+            }));
+            divA[div][sub.name] = {
+              teacher_code: a?.teacherCode || "",
+              room: "",
+              ...(batchAssigns.length ? { batch_assigns: batchAssigns } : {}),
+            };
           });
         });
 
@@ -847,6 +909,7 @@ export default function GenerateTimetable() {
           ybBatchCount={ybBatchCount}
           assignments={assignments}
           setSubjectTeacher={setSubjectTeacher}
+          setLabBatchTeacher={setLabBatchTeacher}
           setActiveTab={setActiveTab}
         />
       )}
