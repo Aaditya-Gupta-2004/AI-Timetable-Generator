@@ -2,15 +2,6 @@ from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Header
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
-# ... other imports ...
-
-app = FastAPI(title="AI Timetable Generator")
-
-# Initialize templates folder
-templates = Jinja2Templates(directory="templates")
-
-# Important: Define the router
-router = APIRouter()
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -118,7 +109,6 @@ class SubjectDB(Base):
     type      = Column(String)
     hours     = Column(Integer)
     lab_hours = Column(Integer, nullable=True)
-    # NEW: link subjects to a specific year-branch
     yb_key    = Column(String, nullable=True)
 
 
@@ -166,7 +156,6 @@ class AssignmentDB(Base):
     batch_assigns_json = Column(Text,    nullable=True)
 
 
-# ── Rooms table ───────────────────────────────────────────────────────────────
 class RoomDB(Base):
     __tablename__ = "rooms"
     id      = Column(Integer, primary_key=True)
@@ -176,26 +165,23 @@ class RoomDB(Base):
     __table_args__ = (UniqueConstraint("user_id", "number", name="uq_user_room"),)
 
 
-# ── NEW: Teacher Load table ───────────────────────────────────────────────────
 class TeacherLoadDB(Base):
     """Max theory + practical sessions per teacher per week."""
     __tablename__ = "teacher_loads"
     id            = Column(Integer, primary_key=True)
     user_id       = Column(Integer, ForeignKey("users.id"), nullable=False)
     teacher_code  = Column(String, nullable=False)
-    max_theory    = Column(Integer, nullable=True)    # None = no limit
-    max_practical = Column(Integer, nullable=True)    # None = no limit
+    max_theory    = Column(Integer, nullable=True)
+    max_practical = Column(Integer, nullable=True)
     __table_args__ = (UniqueConstraint("user_id", "teacher_code", name="uq_user_tload"),)
 
 
-# ── NEW: Personal Timetable table ─────────────────────────────────────────────
 class PersonalTimetableDB(Base):
     """A teacher's self-declared fixed/pinned slots."""
     __tablename__ = "personal_timetables"
     id            = Column(Integer, primary_key=True)
     user_id       = Column(Integer, ForeignKey("users.id"), nullable=False)
     teacher_code  = Column(String, nullable=False)
-    # JSON shape: { "Monday": { "9-10": { "subject":"OS", "room":"304", "yb_key":"SE-IT", "div":"A" } } }
     slots_json    = Column(Text, nullable=False, default="{}")
     __table_args__ = (UniqueConstraint("user_id", "teacher_code", name="uq_user_ptt"),)
 
@@ -211,7 +197,7 @@ def run_migrations():
     # Skip SQLite-specific migrations when using PostgreSQL
     if "sqlite" not in DATABASE_URL:
         return
-    
+
     with engine.connect() as conn:
         sa = __import__("sqlalchemy")
 
@@ -222,8 +208,6 @@ def run_migrations():
         def existing_tables():
             r = conn.execute(sa.text("SELECT name FROM sqlite_master WHERE type='table'"))
             return [row[0] for row in r.fetchall()]
-
-        # ... rest of your migration code stays the same
 
         tables = existing_tables()
 
@@ -252,7 +236,7 @@ def run_migrations():
         if "batch_assigns_json" not in assign_cols:
             conn.execute(sa.text("ALTER TABLE assignments ADD COLUMN batch_assigns_json TEXT"))
 
-        # rooms table (created by Base.metadata.create_all above, but guard anyway)
+        # rooms table
         if "rooms" not in tables:
             conn.execute(sa.text(
                 "CREATE TABLE rooms (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL "
@@ -268,7 +252,6 @@ def run_migrations():
                 "data_json TEXT NOT NULL)"
             ))
 
-        # ── NEW: teacher_loads table ──────────────────────────────────────────
         if "teacher_loads" not in tables:
             conn.execute(sa.text(
                 "CREATE TABLE teacher_loads ("
@@ -279,7 +262,6 @@ def run_migrations():
                 "max_practical INTEGER)"
             ))
 
-        # ── NEW: personal_timetables table ───────────────────────────────────
         if "personal_timetables" not in tables:
             conn.execute(sa.text(
                 "CREATE TABLE personal_timetables ("
@@ -295,7 +277,7 @@ run_migrations()
 
 
 # =========================
-# FASTAPI APP
+# FASTAPI APP  (single definition)
 # =========================
 
 app = FastAPI(title="AI Timetable Generator")
@@ -303,11 +285,15 @@ app = FastAPI(title="AI Timetable Generator")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,  # ← change this
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Initialize templates folder
+templates = Jinja2Templates(directory="templates")
+
+# Single router definition
 router = APIRouter()
 
 
@@ -374,21 +360,17 @@ class ProfileUpdate(BaseModel):
     new_username:  Optional[str] = None
     new_password:  Optional[str] = None
 
-# Save subjects independently (with yb_key)
 class SaveSubjectsInput(BaseModel):
     yb_key:   str
     subjects: List[Subject]
-
 
 class SaveAssignmentsInput(BaseModel):
     yb_key: str
     assignments: Dict[str, Dict[str, Any]]
 
-
 class SaveTimetableRunInput(BaseModel):
     all_timetables: Dict[str, Dict[str, Any]]
 
-# ── NEW: Pydantic models for load management & personal timetable ─────────────
 class TeacherLoadModel(BaseModel):
     teacher_code:  str
     max_theory:    Optional[int] = None
@@ -396,7 +378,6 @@ class TeacherLoadModel(BaseModel):
 
 class PersonalTimetableInput(BaseModel):
     teacher_code: str
-    # { day: { slot: { subject, room, yb_key, div } } }
     slots: Dict[str, Dict[str, Any]]
 
 
@@ -431,18 +412,23 @@ def get_me(username: str = Depends(verify_token)):
 @router.get("/profile")
 def get_profile(username: str = Depends(verify_token), db: Session = Depends(get_db)):
     user = db.query(UserDB).filter(UserDB.username == username).first()
-    if not user: raise HTTPException(status_code=404, detail="User not found")
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
     return {
-        "username": user.username, "full_name": user.full_name or "",
-        "branch": user.branch or "", "job_role": user.job_role or "",
-        "qualification": user.qualification or "", "avatar": user.avatar or "",
+        "username":      user.username,
+        "full_name":     user.full_name or "",
+        "branch":        user.branch or "",
+        "job_role":      user.job_role or "",
+        "qualification": user.qualification or "",
+        "avatar":        user.avatar or "",
     }
 
 
 @router.put("/profile")
 def update_profile(data: ProfileUpdate, username: str = Depends(verify_token), db: Session = Depends(get_db)):
     user = db.query(UserDB).filter(UserDB.username == username).first()
-    if not user: raise HTTPException(status_code=404, detail="User not found")
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
     if data.full_name     is not None: user.full_name     = data.full_name
     if data.branch        is not None: user.branch        = data.branch
     if data.job_role      is not None: user.job_role      = data.job_role
@@ -455,8 +441,11 @@ def update_profile(data: ProfileUpdate, username: str = Depends(verify_token), d
     if data.new_password:
         user.password = hash_password(data.new_password)
     db.commit()
-    return {"message": "Profile updated", "username": user.username,
-            "access_token": create_token({"sub": user.username})}
+    return {
+        "message":      "Profile updated",
+        "username":     user.username,
+        "access_token": create_token({"sub": user.username}),
+    }
 
 
 # =========================
@@ -466,7 +455,8 @@ def update_profile(data: ProfileUpdate, username: str = Depends(verify_token), d
 @router.get("/teachers")
 def get_teachers(username: str = Depends(verify_token), db: Session = Depends(get_db)):
     uid = get_user_id(username, db)
-    return [{"code": t.code, "name": t.name} for t in db.query(TeacherDB).filter(TeacherDB.user_id == uid).all()]
+    return [{"code": t.code, "name": t.name}
+            for t in db.query(TeacherDB).filter(TeacherDB.user_id == uid).all()]
 
 
 @router.post("/teachers/bulk")
@@ -541,14 +531,11 @@ def delete_room(number: str, username: str = Depends(verify_token), db: Session 
 
 
 # =========================
-# NEW: TEACHER LOAD ROUTES
+# TEACHER LOAD ROUTES
 # =========================
 
 @router.get("/teacher-loads")
-def get_teacher_loads(
-    username: str    = Depends(verify_token),
-    db:       Session = Depends(get_db),
-):
+def get_teacher_loads(username: str = Depends(verify_token), db: Session = Depends(get_db)):
     uid  = get_user_id(username, db)
     rows = db.query(TeacherLoadDB).filter(TeacherLoadDB.user_id == uid).all()
     return [
@@ -562,15 +549,10 @@ def get_teacher_loads(
 
 
 @router.post("/teacher-loads/bulk")
-def save_teacher_loads_bulk(
-    loads:    List[TeacherLoadModel],
-    username: str     = Depends(verify_token),
-    db:       Session = Depends(get_db),
-):
+def save_teacher_loads_bulk(loads: List[TeacherLoadModel], username: str = Depends(verify_token), db: Session = Depends(get_db)):
     uid = get_user_id(username, db)
     db.query(TeacherLoadDB).filter(TeacherLoadDB.user_id == uid).delete()
     for l in loads:
-        # Only persist rows that actually have a limit set
         if l.max_theory is not None or l.max_practical is not None:
             db.add(TeacherLoadDB(
                 user_id       = uid,
@@ -583,14 +565,11 @@ def save_teacher_loads_bulk(
 
 
 # =========================
-# NEW: PERSONAL TIMETABLE ROUTES
+# PERSONAL TIMETABLE ROUTES
 # =========================
 
 @router.get("/personal-timetables")
-def get_all_personal_timetables(
-    username: str     = Depends(verify_token),
-    db:       Session = Depends(get_db),
-):
+def get_all_personal_timetables(username: str = Depends(verify_token), db: Session = Depends(get_db)):
     """Return every teacher's pinned slots for the logged-in user."""
     uid  = get_user_id(username, db)
     rows = db.query(PersonalTimetableDB).filter(PersonalTimetableDB.user_id == uid).all()
@@ -598,11 +577,7 @@ def get_all_personal_timetables(
 
 
 @router.post("/personal-timetable")
-def save_personal_timetable(
-    data:     PersonalTimetableInput,
-    username: str     = Depends(verify_token),
-    db:       Session = Depends(get_db),
-):
+def save_personal_timetable(data: PersonalTimetableInput, username: str = Depends(verify_token), db: Session = Depends(get_db)):
     uid  = get_user_id(username, db)
     code = data.teacher_code.strip().upper()
     row  = db.query(PersonalTimetableDB).filter(
@@ -622,11 +597,7 @@ def save_personal_timetable(
 
 
 @router.delete("/personal-timetable/{teacher_code}")
-def delete_personal_timetable(
-    teacher_code: str,
-    username: str     = Depends(verify_token),
-    db:       Session = Depends(get_db),
-):
+def delete_personal_timetable(teacher_code: str, username: str = Depends(verify_token), db: Session = Depends(get_db)):
     uid = get_user_id(username, db)
     db.query(PersonalTimetableDB).filter(
         PersonalTimetableDB.user_id      == uid,
@@ -643,15 +614,19 @@ def delete_personal_timetable(
 @router.get("/subjects")
 def get_subjects(username: str = Depends(verify_token), db: Session = Depends(get_db)):
     uid = get_user_id(username, db)
-    return [{"name":s.name,"type":s.type,"hours":s.hours,"lab_hours":s.lab_hours,"yb_key":s.yb_key}
-            for s in db.query(SubjectDB).filter(SubjectDB.user_id == uid).all()]
+    return [
+        {"name": s.name, "type": s.type, "hours": s.hours, "lab_hours": s.lab_hours, "yb_key": s.yb_key}
+        for s in db.query(SubjectDB).filter(SubjectDB.user_id == uid).all()
+    ]
 
 
 @router.get("/subjects/{yb_key}")
 def get_subjects_for_yb(yb_key: str, username: str = Depends(verify_token), db: Session = Depends(get_db)):
     uid = get_user_id(username, db)
-    return [{"name":s.name,"type":s.type,"hours":s.hours,"lab_hours":s.lab_hours}
-            for s in db.query(SubjectDB).filter(SubjectDB.user_id == uid, SubjectDB.yb_key == yb_key).all()]
+    return [
+        {"name": s.name, "type": s.type, "hours": s.hours, "lab_hours": s.lab_hours}
+        for s in db.query(SubjectDB).filter(SubjectDB.user_id == uid, SubjectDB.yb_key == yb_key).all()
+    ]
 
 
 @router.post("/subjects/bulk")
@@ -661,9 +636,12 @@ def save_subjects_bulk(data: SaveSubjectsInput, username: str = Depends(verify_t
     db.query(SubjectDB).filter(SubjectDB.user_id == uid, SubjectDB.yb_key == data.yb_key).delete()
     for sub in data.subjects:
         db.add(SubjectDB(
-            user_id=uid, yb_key=data.yb_key,
-            name=sub.name, type=sub.type, hours=sub.hours,
-            lab_hours=sub.lab_hours if sub.type == "core_lab" else None,
+            user_id   = uid,
+            yb_key    = data.yb_key,
+            name      = sub.name,
+            type      = sub.type,
+            hours     = sub.hours,
+            lab_hours = sub.lab_hours if sub.type == "core_lab" else None,
         ))
     db.commit()
     return {"message": f"Saved {len(data.subjects)} subjects for {data.yb_key}"}
@@ -687,22 +665,22 @@ def save_assignments_bulk(data: SaveAssignmentsInput, username: str = Depends(ve
     for div, sub_map in (data.assignments or {}).items():
         for sub_name, assign_val in (sub_map or {}).items():
             if isinstance(assign_val, dict):
-                t_code = assign_val.get("teacher_code", "")
-                room = assign_val.get("room", "")
+                t_code        = assign_val.get("teacher_code", "")
+                room          = assign_val.get("room", "")
                 batch_assigns = assign_val.get("batch_assigns") or None
             else:
-                t_code = assign_val
-                room = ""
+                t_code        = assign_val
+                room          = ""
                 batch_assigns = None
 
             db.add(AssignmentDB(
-                user_id=uid,
-                yb_key=data.yb_key,
-                division=div,
-                subject_name=sub_name,
-                teacher_code=t_code,
-                room=room,
-                batch_assigns_json=json.dumps(batch_assigns) if batch_assigns else None,
+                user_id            = uid,
+                yb_key             = data.yb_key,
+                division           = div,
+                subject_name       = sub_name,
+                teacher_code       = t_code,
+                room               = room,
+                batch_assigns_json = json.dumps(batch_assigns) if batch_assigns else None,
             ))
 
     db.commit()
@@ -717,15 +695,11 @@ def save_assignments_bulk(data: SaveAssignmentsInput, username: str = Depends(ve
 def get_year_branches(username: str = Depends(verify_token), db: Session = Depends(get_db)):
     uid  = get_user_id(username, db)
     rows = db.query(YearBranchDB).filter(YearBranchDB.user_id == uid).all()
-    return [{"year":r.year,"branch":r.branch,"divs":json.loads(r.divisions_json)} for r in rows]
+    return [{"year": r.year, "branch": r.branch, "divs": json.loads(r.divisions_json)} for r in rows]
 
 
 @router.post("/year-branches/bulk")
-def save_year_branches_bulk(
-    year_branches: List[dict],
-    username: str = Depends(verify_token),
-    db: Session = Depends(get_db)
-):
+def save_year_branches_bulk(year_branches: List[dict], username: str = Depends(verify_token), db: Session = Depends(get_db)):
     """Save/upsert a list of year-branch records."""
     uid = get_user_id(username, db)
     for yb in year_branches:
@@ -745,9 +719,9 @@ def save_year_branches_bulk(
     return {"message": f"Saved {len(year_branches)} year-branches"}
 
 
-# Legacy compat
 @router.get("/divisions")
 def get_divisions(username: str = Depends(verify_token), db: Session = Depends(get_db)):
+    """Legacy compatibility endpoint."""
     uid  = get_user_id(username, db)
     rows = db.query(YearBranchDB).filter(YearBranchDB.user_id == uid).all()
     divs = []
@@ -761,8 +735,8 @@ def get_divisions(username: str = Depends(verify_token), db: Session = Depends(g
 # TIMETABLE CONSTANTS
 # =========================
 
-DAYS              = ["Monday","Tuesday","Wednesday","Thursday","Friday"]
-SLOTS             = ["9-10","10-11","11-12","12-1","1-2","2-3","3-4","4-5"]
+DAYS              = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+SLOTS             = ["9-10", "10-11", "11-12", "12-1", "1-2", "2-3", "3-4", "4-5"]
 BREAK_SLOT        = "1-2"
 ALLOCATABLE_SLOTS = [s for s in SLOTS if s != BREAK_SLOT]
 OUTPUT_FOLDER     = "output"
@@ -774,8 +748,11 @@ def get_consecutive_runs():
     for i in range(1, len(ALLOCATABLE_SLOTS)):
         p = SLOTS.index(ALLOCATABLE_SLOTS[i-1])
         c = SLOTS.index(ALLOCATABLE_SLOTS[i])
-        if c - p == 1: current.append(i)
-        else:          runs.append(current); current = [i]
+        if c - p == 1:
+            current.append(i)
+        else:
+            runs.append(current)
+            current = [i]
     runs.append(current)
     return runs
 
@@ -794,8 +771,8 @@ def get_batches(div: str) -> list:
     return [f"{div}{i+1}" for i in range(NUM_BATCHES)]
 
 
-def empty_cell(): return {"subject":"","teacher_code":"","room":"","batches":None}
-def break_cell(): return {"subject":"BREAK","teacher_code":"","room":"","batches":None}
+def empty_cell():  return {"subject": "", "teacher_code": "", "room": "", "batches": None}
+def break_cell():  return {"subject": "BREAK", "teacher_code": "", "room": "", "batches": None}
 
 def empty_chromosome():
     ch = {}
@@ -853,22 +830,26 @@ def random_chromosome(subjects: list, teacher_assignments: dict) -> dict:
                 {"batch": b, "teacher_code": "", "room": ""}
                 for b in get_batches("?")
             ]
-            days_order = DAYS.copy(); random.shuffle(days_order)
+            days_order = DAYS.copy()
+            random.shuffle(days_order)
             placed = 0
             for day in days_order:
                 if placed >= hours: break
-                if _place_lab(ch, day, name, lab_size, batch_assigns): placed += 1
+                if _place_lab(ch, day, name, lab_size, batch_assigns):
+                    placed += 1
             att = 0
             while placed < hours and att < 200:
                 att += 1
                 day = random.choice(DAYS)
-                if _place_lab(ch, day, name, lab_size, batch_assigns): placed += 1
+                if _place_lab(ch, day, name, lab_size, batch_assigns):
+                    placed += 1
         else:
             t_code     = assign.get("teacher_code", "")
             room       = assign.get("room", "")
-            days_order = DAYS.copy(); random.shuffle(days_order)
-            rem        = hours
-            passes     = math.ceil(hours / len(DAYS))
+            days_order = DAYS.copy()
+            random.shuffle(days_order)
+            rem   = hours
+            passes = math.ceil(hours / len(DAYS))
             for _ in range(passes):
                 if rem == 0: break
                 for day in days_order:
@@ -876,7 +857,7 @@ def random_chromosome(subjects: list, teacher_assignments: dict) -> dict:
                     free = [s for s in ALLOCATABLE_SLOTS if ch[day][s]["subject"] == ""]
                     if free:
                         ch[day][random.choice(free)] = {
-                            "subject":name,"teacher_code":t_code,"room":room,"batches":None
+                            "subject": name, "teacher_code": t_code, "room": room, "batches": None
                         }
                         rem -= 1
             att = 0
@@ -885,7 +866,7 @@ def random_chromosome(subjects: list, teacher_assignments: dict) -> dict:
                 day  = random.choice(DAYS)
                 slot = random.choice(ALLOCATABLE_SLOTS)
                 if ch[day][slot]["subject"] == "":
-                    ch[day][slot] = {"subject":name,"teacher_code":t_code,"room":room,"batches":None}
+                    ch[day][slot] = {"subject": name, "teacher_code": t_code, "room": room, "batches": None}
                     rem -= 1
     return ch
 
@@ -930,7 +911,8 @@ def fitness(chromosome: dict, subjects: list) -> float:
             score -= max(0, hours - total) * 100
             for day in DAYS:
                 cnt = sum(1 for s in ALLOCATABLE_SLOTS if chromosome[day][s]["subject"] == name)
-                if cnt > 1: score -= (cnt - 1) * 50
+                if cnt > 1:
+                    score -= (cnt - 1) * 50
 
     for day in DAYS:
         day_vals = [chromosome[day][s]["subject"] for s in ALLOCATABLE_SLOTS]
@@ -948,7 +930,8 @@ def tournament_select(population, scores, k):
 
 
 def crossover(pa, pb):
-    if random.random() > GA_CROSSOVER_P: return copy.deepcopy(pa)
+    if random.random() > GA_CROSSOVER_P:
+        return copy.deepcopy(pa)
     child = empty_chromosome()
     for day in DAYS:
         donor = pa if random.random() < 0.5 else pb
@@ -987,8 +970,8 @@ def mutate(chromosome, subjects, teacher_assignments):
                     else:
                         ch[day][slot] = {
                             "subject":      subj,
-                            "teacher_code": assign.get("teacher_code",""),
-                            "room":         assign.get("room",""),
+                            "teacher_code": assign.get("teacher_code", ""),
+                            "room":         assign.get("room", ""),
                             "batches":      None,
                         }
     return ch
@@ -1005,7 +988,8 @@ def ga_generate_timetable(subjects: list, teacher_assignments: dict) -> dict:
         if scores[gen_best_idx] > best_score:
             best_score      = scores[gen_best_idx]
             best_chromosome = copy.deepcopy(population[gen_best_idx])
-        if best_score >= 1000: break
+        if best_score >= 1000:
+            break
 
         sorted_idx     = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
         new_population = [copy.deepcopy(population[i]) for i in sorted_idx[:GA_ELITE]]
@@ -1037,24 +1021,24 @@ def check_teacher_conflicts(all_timetables: dict) -> list:
                         continue
                     if cell.get("batches"):
                         for b in cell["batches"]:
-                            tc = b.get("teacher_code","").strip()
+                            tc = b.get("teacher_code", "").strip()
                             if not tc: continue
                             key = (day, slot, tc)
                             slot_map.setdefault(key, []).append(
-                                {"yb_key":yb_key,"div":div,"batch":b["batch"],"subject":cell["subject"]}
+                                {"yb_key": yb_key, "div": div, "batch": b["batch"], "subject": cell["subject"]}
                             )
                     else:
-                        for tc in (cell.get("teacher_code","") or "").split(","):
+                        for tc in (cell.get("teacher_code", "") or "").split(","):
                             tc = tc.strip()
                             if not tc: continue
                             key = (day, slot, tc)
                             slot_map.setdefault(key, []).append(
-                                {"yb_key":yb_key,"div":div,"batch":"","subject":cell["subject"]}
+                                {"yb_key": yb_key, "div": div, "batch": "", "subject": cell["subject"]}
                             )
 
     for (day, slot, tc), entries in slot_map.items():
         if len(entries) > 1:
-            conflicts.append({"teacher_code":tc,"day":day,"slot":slot,"classes":entries})
+            conflicts.append({"teacher_code": tc, "day": day, "slot": slot, "classes": entries})
 
     return conflicts
 
@@ -1093,15 +1077,15 @@ def normalise_all_timetables(all_timetables: dict) -> dict:
 
 
 def summarise_all_timetables(all_timetables: dict) -> dict:
-    yb_keys = sorted((all_timetables or {}).keys())
+    yb_keys         = sorted((all_timetables or {}).keys())
     division_labels = []
     for yb_key in yb_keys:
-      for div in sorted((all_timetables.get(yb_key) or {}).keys()):
-          division_labels.append(f"{yb_key}-{div}")
+        for div in sorted((all_timetables.get(yb_key) or {}).keys()):
+            division_labels.append(f"{yb_key}-{div}")
     return {
-        "yb_keys": yb_keys,
+        "yb_keys":         yb_keys,
         "division_labels": division_labels,
-        "division_count": len(division_labels),
+        "division_count":  len(division_labels),
     }
 
 
@@ -1133,11 +1117,7 @@ def rebuild_current_timetables(uid: int, db: Session):
 # =========================
 
 @router.post("/generate")
-def generate_timetable(
-    data:     GenerateInput,
-    username: str     = Depends(verify_token),
-    db:       Session = Depends(get_db),
-):
+def generate_timetable(data: GenerateInput, username: str = Depends(verify_token), db: Session = Depends(get_db)):
     uid    = get_user_id(username, db)
     yb_key = f"{data.year.strip().upper()}-{data.branch.strip().upper()}"
 
@@ -1145,8 +1125,12 @@ def generate_timetable(
     db.query(SubjectDB).filter(SubjectDB.user_id == uid, SubjectDB.yb_key == yb_key).delete()
     for sub in data.subjects:
         db.add(SubjectDB(
-            user_id=uid, yb_key=yb_key, name=sub.name, type=sub.type, hours=sub.hours,
-            lab_hours=sub.lab_hours if sub.type == "core_lab" else None,
+            user_id   = uid,
+            yb_key    = yb_key,
+            name      = sub.name,
+            type      = sub.type,
+            hours     = sub.hours,
+            lab_hours = sub.lab_hours if sub.type == "core_lab" else None,
         ))
 
     # Save / update YearBranch
@@ -1159,8 +1143,10 @@ def generate_timetable(
         existing_yb.divisions_json = json.dumps(data.divisions)
     else:
         db.add(YearBranchDB(
-            user_id=uid, year=data.year.upper(), branch=data.branch.upper(),
-            divisions_json=json.dumps(data.divisions),
+            user_id        = uid,
+            year           = data.year.upper(),
+            branch         = data.branch.upper(),
+            divisions_json = json.dumps(data.divisions),
         ))
 
     # Save assignments
@@ -1171,16 +1157,20 @@ def generate_timetable(
     for div, sub_map in (data.teacher_assignments or {}).items():
         for sub_name, assign_val in sub_map.items():
             if isinstance(assign_val, dict):
-                t_code        = assign_val.get("teacher_code","")
-                room          = assign_val.get("room","")
+                t_code        = assign_val.get("teacher_code", "")
+                room          = assign_val.get("room", "")
                 batch_assigns = assign_val.get("batch_assigns") or None
             else:
                 t_code = assign_val; room = ""; batch_assigns = None
 
             db.add(AssignmentDB(
-                user_id=uid, yb_key=yb_key, division=div, subject_name=sub_name,
-                teacher_code=t_code, room=room,
-                batch_assigns_json=json.dumps(batch_assigns) if batch_assigns else None,
+                user_id            = uid,
+                yb_key             = yb_key,
+                division           = div,
+                subject_name       = sub_name,
+                teacher_code       = t_code,
+                room               = room,
+                batch_assigns_json = json.dumps(batch_assigns) if batch_assigns else None,
             ))
 
     db.commit()
@@ -1200,12 +1190,12 @@ def generate_timetable(
             for sub_name, assign_val in (data.teacher_assignments or {}).get(div, {}).items():
                 if isinstance(assign_val, dict):
                     div_assign[sub_name] = {
-                        "teacher_code":  assign_val.get("teacher_code",""),
-                        "room":          assign_val.get("room",""),
+                        "teacher_code":  assign_val.get("teacher_code", ""),
+                        "room":          assign_val.get("room", ""),
                         "batch_assigns": assign_val.get("batch_assigns") or [],
                     }
                 else:
-                    div_assign[sub_name] = {"teacher_code":assign_val,"room":"","batch_assigns":[]}
+                    div_assign[sub_name] = {"teacher_code": assign_val, "room": "", "batch_assigns": []}
             timetables[div] = ga_generate_timetable(subjects_dicts, div_assign)
 
     # Conflict check
@@ -1242,7 +1232,8 @@ def generate_timetable(
 def get_timetable(yb_key: str, username: str = Depends(verify_token), db: Session = Depends(get_db)):
     uid    = get_user_id(username, db)
     record = db.query(TimetableDB).filter(TimetableDB.user_id == uid, TimetableDB.yb_key == yb_key).first()
-    if not record: return {"timetables": {}}
+    if not record:
+        return {"timetables": {}}
     return {"yb_key": yb_key, "timetables": json.loads(record.data_json)}
 
 
@@ -1255,11 +1246,11 @@ def get_all_timetables(username: str = Depends(verify_token), db: Session = Depe
 
 @router.get("/timetable-runs")
 def get_timetable_runs(username: str = Depends(verify_token), db: Session = Depends(get_db)):
-    uid = get_user_id(username, db)
+    uid  = get_user_id(username, db)
     runs = db.query(TimetableRunDB).filter(TimetableRunDB.user_id == uid).order_by(TimetableRunDB.created_at.desc()).all()
     return [
         {
-            "id": run.id,
+            "id":         run.id,
             "created_at": run.created_at,
             **summarise_all_timetables(json.loads(run.data_json)),
         }
@@ -1275,23 +1266,23 @@ def get_timetable_run(run_id: int, username: str = Depends(verify_token), db: Se
         raise HTTPException(status_code=404, detail="Timetable run not found")
     all_timetables = json.loads(run.data_json)
     return {
-        "id": run.id,
-        "created_at": run.created_at,
+        "id":             run.id,
+        "created_at":     run.created_at,
         "all_timetables": all_timetables,
-        "summary": summarise_all_timetables(all_timetables),
+        "summary":        summarise_all_timetables(all_timetables),
     }
 
 
 @router.post("/timetable-runs")
 def save_timetable_run(data: SaveTimetableRunInput, username: str = Depends(verify_token), db: Session = Depends(get_db)):
-    uid = get_user_id(username, db)
+    uid            = get_user_id(username, db)
     all_timetables = normalise_all_timetables(data.all_timetables)
-    created_at = datetime.now(timezone.utc).isoformat()
+    created_at     = datetime.now(timezone.utc).isoformat()
 
     run = TimetableRunDB(
-        user_id=uid,
-        created_at=created_at,
-        data_json=json.dumps(all_timetables),
+        user_id    = uid,
+        created_at = created_at,
+        data_json  = json.dumps(all_timetables),
     )
     db.add(run)
     upsert_current_timetables(uid, all_timetables, db)
@@ -1299,9 +1290,9 @@ def save_timetable_run(data: SaveTimetableRunInput, username: str = Depends(veri
     db.refresh(run)
 
     return {
-        "id": run.id,
+        "id":         run.id,
         "created_at": created_at,
-        "summary": summarise_all_timetables(all_timetables),
+        "summary":    summarise_all_timetables(all_timetables),
     }
 
 
@@ -1311,54 +1302,48 @@ def delete_timetable_run(run_id: int, username: str = Depends(verify_token), db:
     run = db.query(TimetableRunDB).filter(TimetableRunDB.user_id == uid, TimetableRunDB.id == run_id).first()
     if not run:
         raise HTTPException(status_code=404, detail="Timetable run not found")
-
     db.delete(run)
     db.commit()
     rebuild_current_timetables(uid, db)
     db.commit()
-
     return {"message": "Timetable run deleted"}
 
 
 @router.get("/teacher-timetable/{teacher_code}")
-def get_teacher_timetable(
-    teacher_code: str,
-    username: str  = Depends(verify_token),
-    db: Session    = Depends(get_db),
-):
+def get_teacher_timetable(teacher_code: str, username: str = Depends(verify_token), db: Session = Depends(get_db)):
     uid     = get_user_id(username, db)
     records = db.query(TimetableDB).filter(TimetableDB.user_id == uid).all()
 
     teacher_grid = {day: {slot: [] for slot in SLOTS} for day in DAYS}
 
     for record in records:
-        yb_key  = record.yb_key
-        div_tt  = json.loads(record.data_json)
+        yb_key = record.yb_key
+        div_tt = json.loads(record.data_json)
         for div, grid in div_tt.items():
             for day in DAYS:
                 for slot in ALLOCATABLE_SLOTS:
                     cell = grid.get(day, {}).get(slot, {})
-                    if not cell.get("subject") or cell["subject"] == "BREAK": continue
-
+                    if not cell.get("subject") or cell["subject"] == "BREAK":
+                        continue
                     if cell.get("batches"):
                         for b in cell["batches"]:
-                            if b.get("teacher_code","") == teacher_code:
+                            if b.get("teacher_code", "") == teacher_code:
                                 teacher_grid[day][slot].append({
                                     "subject":  cell["subject"],
                                     "yb_label": yb_key,
                                     "div":      div,
                                     "batch":    b["batch"],
-                                    "room":     b.get("room",""),
+                                    "room":     b.get("room", ""),
                                 })
                     else:
-                        codes = [c.strip() for c in (cell.get("teacher_code","") or "").split(",")]
+                        codes = [c.strip() for c in (cell.get("teacher_code", "") or "").split(",")]
                         if teacher_code in codes:
                             teacher_grid[day][slot].append({
                                 "subject":  cell["subject"],
                                 "yb_label": yb_key,
                                 "div":      div,
                                 "batch":    "",
-                                "room":     cell.get("room",""),
+                                "room":     cell.get("room", ""),
                             })
 
     return {"teacher_code": teacher_code, "timetable": teacher_grid}
@@ -1390,23 +1375,32 @@ def export_excel(all_timetables: dict) -> str:
     file_path = os.path.join(OUTPUT_FOLDER, "timetable.xlsx")
 
     slot_labels = {
-        "9-10":"9:00-10:00","10-11":"10:00-11:00","11-12":"11:00-12.00",
-        "12-1":"12:00-01:00","1-2":"01:00-2:00","2-3":"2:00-3:00",
-        "3-4":"3:00-4:00","4-5":"4:00-5:00",
+        "9-10":  "9:00-10:00",
+        "10-11": "10:00-11:00",
+        "11-12": "11:00-12.00",
+        "12-1":  "12:00-01:00",
+        "1-2":   "01:00-2:00",
+        "2-3":   "2:00-3:00",
+        "3-4":   "3:00-4:00",
+        "4-5":   "4:00-5:00",
     }
-    day_short = {"Monday":"Mon","Tuesday":"Tue","Wednesday":"Wed","Thursday":"Thu","Friday":"Fri"}
+    day_short = {
+        "Monday": "Mon", "Tuesday": "Tue", "Wednesday": "Wed",
+        "Thursday": "Thu", "Friday": "Fri",
+    }
 
     with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
         for yb_key, div_grids in all_timetables.items():
             for div, grid in div_grids.items():
                 sheet_name = f"{yb_key}-{div}"[:31]
                 aoa = []
-                for _ in range(5): aoa.append([None]*11)
-                aoa.append([None, None, "Department"] + [None]*8)
-                aoa.append([None, None, "Time Table"] + [None]*8)
-                aoa.append([None]*10 + [f"{yb_key}-{div}"])
+                for _ in range(5):
+                    aoa.append([None] * 11)
+                aoa.append([None, None, "Department"] + [None] * 8)
+                aoa.append([None, None, "Time Table"]  + [None] * 8)
+                aoa.append([None] * 10 + [f"{yb_key}-{div}"])
                 aoa.append([None, None, "Day/Time"] + [slot_labels[s] for s in SLOTS])
-                aoa.append([None]*11)
+                aoa.append([None] * 11)
 
                 for day in DAYS:
                     sub_row = [None, None, day_short[day]]
@@ -1415,24 +1409,26 @@ def export_excel(all_timetables: dict) -> str:
                     for slot in SLOTS:
                         cell = grid.get(day, {}).get(slot, {})
                         if slot == BREAK_SLOT:
-                            sub_row.append("BREAK"); tc_row.append(None); rm_row.append(None)
+                            sub_row.append("BREAK")
+                            tc_row.append(None)
+                            rm_row.append(None)
                         else:
-                            sub_row.append(cell.get("subject","") or "")
+                            sub_row.append(cell.get("subject", "") or "")
                             if cell.get("batches"):
                                 tc_row.append(" | ".join(
-                                    f"{b['batch']}:{b.get('teacher_code','—')}" for b in cell["batches"]
+                                    f"{b['batch']}:{b.get('teacher_code', '—')}" for b in cell["batches"]
                                 ))
                                 rm_row.append(" | ".join(
-                                    f"{b['batch']}:{b.get('room','—')}" for b in cell["batches"]
+                                    f"{b['batch']}:{b.get('room', '—')}" for b in cell["batches"]
                                 ))
                             else:
-                                tc_row.append(cell.get("teacher_code","") or "")
-                                rm_row.append(cell.get("room","") or "")
+                                tc_row.append(cell.get("teacher_code", "") or "")
+                                rm_row.append(cell.get("room", "") or "")
                     aoa.append(sub_row)
                     aoa.append(tc_row)
                     aoa.append(rm_row)
-                    aoa.append([None]*11)
-                import pandas as pd
+                    aoa.append([None] * 11)
+
                 df = pd.DataFrame(aoa)
                 df.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
 
@@ -1440,16 +1436,9 @@ def export_excel(all_timetables: dict) -> str:
 
 
 # =========================
-# INCLUDE ROUTER
+# ADMIN ROUTES
 # =========================
 
-app.include_router(router)
-
-
-from fastapi import Header
-
-# THIS IS YOUR MASTER KEY.
-# You must type this EXACTLY into the HTML input box.
 ADMIN_SECRET_TOKEN = "backend_dev_2026_access"
 
 @router.get("/admin", response_class=HTMLResponse)
@@ -1460,27 +1449,20 @@ def admin_panel(request: Request):
 def admin_db_explorer(x_admin_token: str = Header(None), db: Session = Depends(get_db)):
     if x_admin_token != ADMIN_SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid Admin Token")
-
     timetables = db.query(TimetableDB).all()
-    users = db.query(UserDB).all()
-
+    users      = db.query(UserDB).all()
     return {
         "timetables": [
-            {
-                "id": t.id,
-                "yb_key": t.yb_key,
-                "user_id": t.user_id,
-                "data": json.loads(t.data_json)
-            } for t in timetables
+            {"id": t.id, "yb_key": t.yb_key, "user_id": t.user_id, "data": json.loads(t.data_json)}
+            for t in timetables
         ],
-        "users": [{"id": u.id, "username": u.username} for u in users]
+        "users": [{"id": u.id, "username": u.username} for u in users],
     }
 
 @router.delete("/admin/delete-timetable/{tt_id}")
 def admin_delete_timetable(tt_id: int, x_admin_token: str = Header(None), db: Session = Depends(get_db)):
     if x_admin_token != ADMIN_SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
-
     record = db.query(TimetableDB).filter(TimetableDB.id == tt_id).first()
     if record:
         db.delete(record)
@@ -1489,6 +1471,13 @@ def admin_delete_timetable(tt_id: int, x_admin_token: str = Header(None), db: Se
     raise HTTPException(status_code=404, detail="Not found")
 
 
+# =========================
+# ROOT & INCLUDE ROUTER
+# =========================
+
 @app.get("/")
 def home():
     return {"message": "AI Timetable Generator — Multi-Year · Multi-Branch · Lab Batches · Teacher-Aware"}
+
+# Include router ONCE at the end
+app.include_router(router)
