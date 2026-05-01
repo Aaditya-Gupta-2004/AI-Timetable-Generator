@@ -208,6 +208,10 @@ Base.metadata.create_all(bind=engine)
 # =========================
 
 def run_migrations():
+    # Skip SQLite-specific migrations when using PostgreSQL
+    if "sqlite" not in DATABASE_URL:
+        return
+    
     with engine.connect() as conn:
         sa = __import__("sqlalchemy")
 
@@ -218,6 +222,8 @@ def run_migrations():
         def existing_tables():
             r = conn.execute(sa.text("SELECT name FROM sqlite_master WHERE type='table'"))
             return [row[0] for row in r.fetchall()]
+
+        # ... rest of your migration code stays the same
 
         tables = existing_tables()
 
