@@ -1,24 +1,34 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// timetableHelpers.js — v6
+// timetableHelpers.js — v7
 //
-// FIXES vs v5:
-//   1. NO GAPS — EVER
-//      - fillRemedials replaced by compactAndFillRemedials which:
-//        a) Detects how many real sessions a day has
-//        b) If a day has ≤2 sessions → shifts lectures to start LATE
-//           (≤1 session starts at slot index 2 = 11–12, ≤2 starts at 1 = 10–11)
-//        c) Fills ALL empty slots before the first lecture AND after the last
-//           lecture with REMEDIAL. No mid-day gaps possible.
-//   2. BALANCED SPREADING
-//      - placeTheorySubject now uses a "balance" day order when total weekly
-//        sessions across all subjects are low, so no day gets just 1 lecture
-//        while Mon–Wed are packed.
-//      - spreadDayOrder: prefers days with FEWER occupied slots (spread first),
-//        used when the division has few total sessions.
-//   3. MINIMUM 9–3 GUARANTEE
-//      - compactAndFillRemedials only does late-start if the day would end
-//        before slot index 3 (12–1). If lectures reach at least 12–1, start
-//        stays at 9:00 regardless of count.
+// FIXES vs v6:
+//   1. NO MID-DAY REMEDIAL GAPS — EVER
+//      - compactAndFillRemedials now COMPACTS sessions together first
+//        (removes any in-between gaps by shifting sessions to be contiguous),
+//        THEN applies late-start logic, THEN fills empty edges with REMEDIAL.
+//      - Guarantees: all real sessions are a solid block, REMEDIAL only at edges.
+//
+//   2. MINI-PROJECT PADDING for sparse days
+//      - After theory placement, any day that still has < MIN_DAY_SESSIONS real
+//        sessions gets "Mini Project" injected to pad it up to MIN_DAY_SESSIONS.
+//      - Default MIN_DAY_SESSIONS = 4 (so every day has at least 4 sessions before
+//        BREAK is counted).
+//
+//   3. LATE-START → MINIMUM END-TIME GUARANTEE
+//      - A day's lecture block must end at ALLOC index ≥ 5 (i.e. reach 3–4 slot).
+//      - If a block is short, it is moved as late as needed so it ends at index 5+,
+//        while still starting no earlier than index 0.
+//      - This ensures "if lecture starts at 11am it goes to at least 4pm".
+//
+//   4. BETTER DAY BALANCING
+//      - placeTheorySubject uses a two-phase approach:
+//        Phase A (spread): distribute 1 session per day across ALL 5 days first.
+//        Phase B (fill):   place remaining sessions by packing.
+//      - This guarantees each day gets at least 1 theory lecture before any day
+//        gets a second one.
+//
+//   5. MINI-PROJECT fills remaining empty slots on sparse days as a contiguous block
+//      adjacent to existing lectures (no isolated mini-project with gaps).
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { API_BASE } from "../config/api";
@@ -54,6 +64,14 @@ export const uid        = () => Math.random().toString(36).slice(2, 8);
 export const norm       = s  => s.trim().toUpperCase();
 export const getBatches = (div, numBatches) =>
   Array.from({ length: numBatches }, (_, i) => `${div}${i + 1}`);
+
+// Minimum real sessions per day (excluding BREAK and REMEDIAL).
+// Days below this threshold get Mini Project padding.
+const MIN_DAY_SESSIONS = 4;
+
+// ALLOC index that the lecture block must reach or exceed (0-based).
+// Index 5 = "3-4" slot (i.e. block must end at 3pm or later).
+const MIN_END_ALLOC_IDX = 5;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // toCodeStr
@@ -134,21 +152,20 @@ function countOccupied(grid, day) {
   return ALLOC.filter(s => grid[day][s].subject !== "").length;
 }
 
+// ── Count REAL (non-remedial) sessions on a day ───────────────────────────────
+function countReal(grid, day) {
+  return ALLOC.filter(s => {
+    const subj = grid[day][s].subject;
+    return subj !== "" && subj !== "REMEDIAL";
+  }).length;
+}
+
 // ── Day ordering: pack (most-occupied first) ───────────────────────────────────
-/**
- * Used when we WANT to stack lectures (Mon–Wed full, labs etc).
- * Days with more content come first so new sessions pile on already-busy days.
- */
 function packedDayOrder(grid) {
   return [...DAYS].sort((a, b) => countOccupied(grid, b) - countOccupied(grid, a));
 }
 
 // ── Day ordering: spread (least-occupied first) ────────────────────────────────
-/**
- * Used for theory subjects when total weekly load is LOW.
- * Prefers empty days so sessions distribute across the week instead of
- * piling on Mon–Wed (which leaves Thu/Fri with only 1–2 isolated lectures).
- */
 function spreadDayOrder(grid) {
   return [...DAYS].sort((a, b) => countOccupied(grid, a) - countOccupied(grid, b));
 }
@@ -229,7 +246,6 @@ export function placeLabRotations(
     const labSz = Math.max(...batchAssign.map(ba => parseInt(ba.sub.labHours) || 2));
     let placed  = false;
 
-    // Sort days: prefer days with fewest lab rounds AND most existing content (pack)
     const sortedDays = [...DAYS].sort((a, b) => {
       const labDiff = labRoundsOnDay[a].length - labRoundsOnDay[b].length;
       if (labDiff !== 0) return labDiff;
@@ -380,33 +396,54 @@ function placeElectiveLabGroup(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// THEORY SUBJECT PLACER
+// THEORY SUBJECT PLACER — v7
 //
-// FIX v6: Accepts a `useSpread` flag. When true, uses spreadDayOrder so
-// sessions are distributed across all 5 days instead of piling on Mon–Wed.
-// This prevents Thu/Fri from getting only 1 isolated lecture.
+// Two-phase strategy:
+//   Phase A: Spread — place exactly 1 session on each day that doesn't have one yet.
+//            Iterates days in spread order (fewest occupied first).
+//   Phase B: Pack  — place remaining sessions by packing onto busiest days.
+//
+// This guarantees all 5 days get at least 1 theory lecture before any day gets 2.
 // ─────────────────────────────────────────────────────────────────────────────
 function placeTheorySubject(
   grid, sub, teacherCode, room,
   globalTeacherSlots, globalRoomSlots,
-  maxPerDay = 3,
-  useSpread = false
+  maxPerDay = 3
 ) {
-  const sessions  = parseInt(sub.hours) || 1;
-  const dayCount  = {};
+  const sessions = parseInt(sub.hours) || 1;
+  const dayCount = {};
   let placed = 0;
 
-  for (let pass = 0; pass < 3 && placed < sessions; pass++) {
-    // On pass 0: spread or pack based on flag; on pass 1+: always pack to fill remaining
-    const dayOrder = (pass === 0 && useSpread)
-      ? spreadDayOrder(grid)
-      : packedDayOrder(grid);
+  // ── Phase A: Spread — 1 per day, fewest-occupied days first ────────────────
+  const spreadOrder = spreadDayOrder(grid);
+  for (const day of spreadOrder) {
+    if (placed >= sessions) break;
+    if ((dayCount[day] || 0) >= 1) continue;
 
-    for (const day of dayOrder) {
+    for (let ai = 0; ai < ALLOC.length; ai++) {
+      const slot = ALLOC[ai];
+      if (
+        grid[day][slot].subject === "" &&
+        teacherFree(globalTeacherSlots, teacherCode, day, [ai]) &&
+        roomFree(globalRoomSlots, room, day, [ai])
+      ) {
+        grid[day][slot] = { subject: sub.name, teacherCode, room, batches: null, electives: null };
+        markTeacher(globalTeacherSlots, teacherCode, day, [ai]);
+        markRoom(globalRoomSlots, room, day, [ai]);
+        dayCount[day] = (dayCount[day] || 0) + 1;
+        placed++;
+        break;
+      }
+    }
+  }
+
+  // ── Phase B: Pack — fill remaining sessions, busiest days first ─────────────
+  for (let pass = 0; pass < 5 && placed < sessions; pass++) {
+    const packOrder = packedDayOrder(grid);
+    for (const day of packOrder) {
       if (placed >= sessions) break;
-      if ((dayCount[day] || 0) >= (pass === 0 ? 1 : maxPerDay)) continue;
+      if ((dayCount[day] || 0) >= maxPerDay) continue;
 
-      // Sequential scan: pick the first free slot on this day
       for (let ai = 0; ai < ALLOC.length; ai++) {
         const slot = ALLOC[ai];
         if (
@@ -414,13 +451,7 @@ function placeTheorySubject(
           teacherFree(globalTeacherSlots, teacherCode, day, [ai]) &&
           roomFree(globalRoomSlots, room, day, [ai])
         ) {
-          grid[day][slot] = {
-            subject: sub.name,
-            teacherCode,
-            room,
-            batches:   null,
-            electives: null,
-          };
+          grid[day][slot] = { subject: sub.name, teacherCode, room, batches: null, electives: null };
           markTeacher(globalTeacherSlots, teacherCode, day, [ai]);
           markRoom(globalRoomSlots, room, day, [ai]);
           dayCount[day] = (dayCount[day] || 0) + 1;
@@ -491,101 +522,146 @@ function placeElectiveGroup(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// COMPACT AND FILL REMEDIALS — v6
+// MINI-PROJECT PADDER — v7
 //
-// This replaces the old fillRemedials. It does THREE things:
+// For any day that has fewer than MIN_DAY_SESSIONS real sessions, inject
+// "Mini Project" sessions into empty ALLOC slots until the threshold is met.
+// Sessions are added ADJACENT to existing content (appended right after the
+// last real session) so there are never gaps.
 //
-//   1. DETECT sparse days: count real sessions on each day after all placers run.
+// Mini Project is a soft filler — no teacher/room conflict tracking needed
+// since it's a self-directed activity. Room is left blank.
+// ─────────────────────────────────────────────────────────────────────────────
+function padWithMiniProject(grid) {
+  DAYS.forEach(day => {
+    const realCount = countReal(grid, day);
+    if (realCount >= MIN_DAY_SESSIONS) return;
+
+    const needed = MIN_DAY_SESSIONS - realCount;
+
+    // Find the last occupied ALLOC index
+    let lastOccupiedAI = -1;
+    for (let ai = ALLOC.length - 1; ai >= 0; ai--) {
+      const subj = grid[day][ALLOC[ai]].subject;
+      if (subj !== "" && subj !== "REMEDIAL") { lastOccupiedAI = ai; break; }
+    }
+
+    // Also find the first occupied ALLOC index
+    let firstOccupiedAI = ALLOC.length;
+    for (let ai = 0; ai < ALLOC.length; ai++) {
+      const subj = grid[day][ALLOC[ai]].subject;
+      if (subj !== "" && subj !== "REMEDIAL") { firstOccupiedAI = ai; break; }
+    }
+
+    let added = 0;
+
+    // Strategy: append after last session first, then prepend before first if needed
+    // Append after last session
+    for (let ai = lastOccupiedAI + 1; ai < ALLOC.length && added < needed; ai++) {
+      if (grid[day][ALLOC[ai]].subject === "") {
+        grid[day][ALLOC[ai]] = {
+          subject: "Mini Project", teacherCode: "", room: "",
+          batches: null, electives: null, isMiniProject: true,
+        };
+        added++;
+      }
+    }
+
+    // Prepend before first session if still need more
+    for (let ai = firstOccupiedAI - 1; ai >= 0 && added < needed; ai--) {
+      if (grid[day][ALLOC[ai]].subject === "") {
+        grid[day][ALLOC[ai]] = {
+          subject: "Mini Project", teacherCode: "", room: "",
+          batches: null, electives: null, isMiniProject: true,
+        };
+        added++;
+      }
+    }
+
+    // If day was completely empty (shouldn't happen after theory spread, but safety)
+    if (firstOccupiedAI === ALLOC.length) {
+      // Start from the late-morning position (index 1 = 10-11)
+      for (let ai = 1; ai < ALLOC.length && added < needed; ai++) {
+        if (grid[day][ALLOC[ai]].subject === "") {
+          grid[day][ALLOC[ai]] = {
+            subject: "Mini Project", teacherCode: "", room: "",
+            batches: null, electives: null, isMiniProject: true,
+          };
+          added++;
+        }
+      }
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COMPACT AND FILL REMEDIALS — v7
 //
-//   2. LATE START for very sparse days:
-//      - A day with only 1 real session → shift it to start at ALLOC index 2
-//        (11:00–12:00), so the day goes 11–12 then REMEDIAL rest.
-//        Unless the lecture is already at or past index 2.
-//      - A day with only 2 real sessions → shift to start at ALLOC index 1
-//        (10:00–11:00), so day goes 10–12 then REMEDIAL rest.
-//        Unless already at/past index 1.
-//      - EXCEPTION: if the last session is at ALLOC index ≥ 3 (12–1 or later),
-//        don't shift — the day already reaches a reasonable hour.
+// Three steps per day:
 //
-//   3. FILL REMEDIAL everywhere there's no real content:
-//      Before first lecture → REMEDIAL
-//      After last lecture → REMEDIAL
-//      Any gap in between → REMEDIAL (shouldn't happen with sequential placers,
-//      but this is the safety net)
+//   STEP 1 — COMPACT: Collect all real session cells in their current order.
+//            Remove them from the grid. Re-place them consecutively starting
+//            at ALLOC index 0. This eliminates any mid-day gaps.
 //
-// Result: every day is a clean block. No isolated lectures with empty space
-// around them. The BREAK slot is always preserved as BREAK.
+//   STEP 2 — LATE-START / END-TIME GUARANTEE:
+//            If the compacted block ends before MIN_END_ALLOC_IDX (3-4 slot),
+//            shift the entire block rightward so it ends exactly at
+//            MIN_END_ALLOC_IDX (or as close as possible without overflow).
+//            This ensures "if lectures are few, they go late in the day".
+//
+//   STEP 3 — FILL REMEDIAL: Every empty ALLOC slot (before and after the block)
+//            becomes REMEDIAL. Since the block is now contiguous, there are
+//            ZERO mid-day gaps.
+//
+// The BREAK slot is always preserved.
 // ─────────────────────────────────────────────────────────────────────────────
 function compactAndFillRemedials(grid) {
   DAYS.forEach(day => {
-    // Find indices in ALLOC that have real content
-    const occupiedAIs = ALLOC
-      .map((slot, ai) => ({ slot, ai, subject: grid[day][slot].subject }))
-      .filter(x => x.subject !== "" && x.subject !== "BREAK");
+    // ── STEP 1: Collect real sessions in order ─────────────────────────────
+    const realSessions = [];
+    ALLOC.forEach((slot, ai) => {
+      const cell = grid[day][slot];
+      const subj = cell.subject;
+      if (subj !== "" && subj !== "REMEDIAL") {
+        realSessions.push({ ai, cell: { ...cell } });
+      }
+    });
 
-    if (occupiedAIs.length === 0) {
-      // Completely empty day — fill all ALLOC slots with REMEDIAL
+    // Clear all ALLOC slots (real content + any stale empties/remedials)
+    ALLOC.forEach(slot => {
+      grid[day][slot] = { subject: "", teacherCode: "", room: "", batches: null, electives: null };
+    });
+
+    if (realSessions.length === 0) {
+      // Completely empty day — fill everything with REMEDIAL
       ALLOC.forEach(slot => {
-        if (grid[day][slot].subject === "") {
-          grid[day][slot] = { subject: "REMEDIAL", teacherCode: "", room: "", batches: null, electives: null, isRemedial: true };
-        }
+        grid[day][slot] = {
+          subject: "REMEDIAL", teacherCode: "", room: "", batches: null, electives: null, isRemedial: true,
+        };
       });
       return;
     }
 
-    const firstAI = occupiedAIs[0].ai;
-    const lastAI  = occupiedAIs[occupiedAIs.length - 1].ai;
-    const count   = occupiedAIs.length;
+    // ── STEP 2: Determine start position with end-time guarantee ──────────
+    const blockLen = realSessions.length;
 
-    // ── LATE START LOGIC ────────────────────────────────────────────────────
-    // Only shift if the day ends "too early" (lastAI < 3, meaning before 12–1)
-    // and it's worth shifting (not already shifted or at a good start position)
-    let targetStartAI = 0; // default: 9:00
+    // We want the block to end at or after MIN_END_ALLOC_IDX.
+    // Ideal start = MIN_END_ALLOC_IDX - blockLen + 1
+    // But start must be ≥ 0 and end must be < ALLOC.length
+    const idealStart = Math.max(0, MIN_END_ALLOC_IDX - blockLen + 1);
+    const maxStart   = ALLOC.length - blockLen;
+    const startAI    = Math.min(idealStart, maxStart);
 
-    if (lastAI < 3) {
-      // Day ends before 12–1 → consider late start
-      if (count === 1) {
-        // Only 1 lecture: start at 11:00 (ALLOC index 2)
-        targetStartAI = 2;
-      } else if (count === 2) {
-        // 2 lectures: start at 10:00 (ALLOC index 1)
-        targetStartAI = 1;
-      }
-      // 3+ lectures ending before 12–1: start stays at 9:00 (shouldn't happen often)
-    }
+    // ── Place the compacted block ──────────────────────────────────────────
+    realSessions.forEach(({ cell }, i) => {
+      grid[day][ALLOC[startAI + i]] = { ...cell };
+    });
 
-    // Apply shift if current start is earlier than target
-    if (firstAI < targetStartAI) {
-      const shift = targetStartAI - firstAI;
-      // Check if all occupied slots can shift right by `shift` without hitting BREAK
-      const canShift = occupiedAIs.every(x => {
-        const newAI = x.ai + shift;
-        return newAI < ALLOC.length; // stays within ALLOC bounds
-      });
-
-      if (canShift) {
-        // Move sessions: copy content to shifted positions, clear originals
-        // Process in reverse order to avoid overwriting
-        const reversed = [...occupiedAIs].reverse();
-        reversed.forEach(x => {
-          const newSlot = ALLOC[x.ai + shift];
-          const oldSlot = x.slot;
-          grid[day][newSlot] = { ...grid[day][oldSlot] };
-          grid[day][oldSlot] = { subject: "", teacherCode: "", room: "", batches: null, electives: null };
-        });
-      }
-    }
-
-    // ── FILL ALL EMPTY ALLOC SLOTS WITH REMEDIAL ────────────────────────────
+    // ── STEP 3: Fill remaining slots with REMEDIAL ─────────────────────────
     ALLOC.forEach(slot => {
       if (grid[day][slot].subject === "") {
         grid[day][slot] = {
-          subject:     "REMEDIAL",
-          teacherCode: "",
-          room:        "",
-          batches:     null,
-          electives:   null,
-          isRemedial:  true,
+          subject: "REMEDIAL", teacherCode: "", room: "", batches: null, electives: null, isRemedial: true,
         };
       }
     });
@@ -618,8 +694,9 @@ function normaliseAssignments(rawAssignments) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SINGLE-DIVISION GENERATOR
-// Order: Core Labs → Elective Labs → Theory Electives → Theory → Remedials(end)
+// SINGLE-DIVISION GENERATOR — v7
+// Order: Core Labs → Elective Labs → Theory Electives → Theory →
+//        Mini-Project Padding → Remedials (compacted, no gaps)
 // ─────────────────────────────────────────────────────────────────────────────
 export function generateTimetable(
   subjects,
@@ -682,27 +759,25 @@ export function generateTimetable(
     );
   });
 
-  // ── Step 4: Theory subjects ────────────────────────────────────────────────
-  // Calculate total theory sessions to decide spread vs pack strategy.
-  // If total sessions ≤ 12 (avg ≤ 2.4/day), use spread so no day gets starved.
-  // If sessions > 12, pack (days will naturally fill up).
-  const totalTheorySessions = theorySubjects.reduce((sum, s) => sum + (parseInt(s.hours) || 1), 0);
-  const useSpread = totalTheorySessions <= 12;
-
+  // ── Step 4: Theory subjects (always spread-first in v7) ────────────────────
   theorySubjects.forEach(sub => {
     const teacherCode = toCodeStr(normAssign[sub.id]?.teacherCode);
     const room        = pickRoom(classroomPool, cUsed);
     placeTheorySubject(
       grid, sub, teacherCode, room,
       globalTeacherSlots, globalRoomSlots,
-      3,          // maxPerDay
-      useSpread   // spread across days when weekly load is low
+      3  // maxPerDay
     );
   });
 
-  // ── Step 5: Compact + Remedials ────────────────────────────────────────────
-  // v6: compactAndFillRemedials handles late-start for sparse days AND
-  // fills ALL empty slots (before, after, and between lectures) with REMEDIAL.
+  // ── Step 5: Mini-Project padding for sparse days ───────────────────────────
+  // Any day with < MIN_DAY_SESSIONS real sessions gets Mini Project filler
+  // placed adjacent to existing content (no gaps created).
+  padWithMiniProject(grid);
+
+  // ── Step 6: Compact + Remedials ────────────────────────────────────────────
+  // Compacts all sessions into a contiguous block, applies end-time guarantee,
+  // then fills edges with REMEDIAL. Guarantees zero mid-day gaps.
   compactAndFillRemedials(grid);
 
   return grid;
@@ -944,6 +1019,7 @@ export function generatePDF(grid, caption, dept, semLabel, teachers, footerRoles
       const cell = grid[day]?.[slot];
       if (slot === BREAK_SLOT) return `<td class="break-cell">BREAK</td>`;
       if (!cell?.subject || cell.subject === "REMEDIAL") return `<td class="remedial-cell">REMEDIAL</td>`;
+      if (cell.subject === "Mini Project") return `<td class="mini-project-cell"><strong>Mini Project</strong></td>`;
       if (cell.batches?.length) {
         return `<td class="lab-cell">${cell.batches.map(b => {
           const code = toCodeStr(b.teacherCode);
@@ -972,6 +1048,7 @@ export function generatePDF(grid, caption, dept, semLabel, teachers, footerRoles
     table{width:100%;border-collapse:collapse;margin-bottom:16px;}th,td{border:1px solid #d0d5dd;padding:6px 7px;text-align:center;font-size:10px;vertical-align:middle;}
     th{background:#667eea;color:#fff;font-weight:700;}.day-cell{background:#f1f5ff;font-weight:700;}.break-cell{background:#fff3e0;color:#e65100;font-weight:700;font-style:italic;}
     .remedial-cell{background:#f0f0f0;color:#999;font-weight:600;font-style:italic;}
+    .mini-project-cell{background:#f0f7ff;color:#1a56a0;font-weight:600;}
     .lab-cell{background:#e8f5e9;color:#2e7d32;}
     .elective-cell{background:#fffbf0;color:#92400e;}
     .elective-lab-cell{background:#f0f0ff;color:#3730a3;}
@@ -1092,6 +1169,7 @@ export const S = {
   dayCell:     { padding: "8px 14px", fontWeight: 700, color: "#445", background: "#f7f8ff", borderRight: "2px solid #d0d9f0", fontSize: 12, whiteSpace: "nowrap" },
   breakCell:   { background: "#fff3e0", color: "#e65100", fontWeight: 700, fontStyle: "italic" },
   labCell:     { background: "#e8f5e9", color: "#2e7d32", fontWeight: 600 },
+  miniProjectCell: { background: "#f0f7ff", color: "#1a56a0", fontWeight: 600 },
   tabBar:      { display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 20, borderBottom: "2px solid #e8ecf5", paddingBottom: 0 },
   tab:         { padding: "9px 18px", fontSize: 13, border: "none", background: "none", cursor: "pointer", color: "#888", fontWeight: 500, borderBottom: "2px solid transparent", marginBottom: -2 },
   tabActive:   { color: "#667eea", borderBottomColor: "#667eea", fontWeight: 700 },
